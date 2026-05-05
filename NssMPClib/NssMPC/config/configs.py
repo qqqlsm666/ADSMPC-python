@@ -16,6 +16,19 @@ config_path = base_path + 'config.json'
 with open(config_path, 'r') as config_file:
     config = json.load(config_file)
 
+PORT_OFFSET = int(os.environ.get('NSSMPC_PORT_OFFSET', '0'))
+
+if PORT_OFFSET:
+    def _offset_ports(item):
+        if isinstance(item, dict):
+            for key, value in item.items():
+                if key.endswith('PORT') and isinstance(value, int):
+                    item[key] = value + PORT_OFFSET
+                else:
+                    _offset_ports(value)
+
+    _offset_ports(config)
+
 BIT_LEN = config['BIT_LEN']
 LAMBDA = config['LAMBDA']
 GE_TYPE = config['GE_TYPE']

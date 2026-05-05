@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ps -W)",
+      "Bash(tasklist)",
+      "Bash(nvidia-smi)",
+      "Bash(nvidia-smi *)",
+      "Bash(where cl.exe)",
+      "Bash(where nvcc *)",
+      "Bash(nvcc --version)",
+      "Bash(cmd //c \"D:\\\\\\\\桌面\\\\\\\\加密rag\\\\\\\\ADSMPC-python\\\\\\\\NssMPClib\\\\\\\\csprng\\\\\\\\build_cpu.bat\")",
+      "Bash(tee /tmp/csprng_build.log)",
+      "Bash(cmd //c 'call \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" && set FORCE_CPU=1 && set DISTUTILS_USE_SDK=1 && D:\\\\anaconda\\\\envs\\\\ADSMPC-python\\\\python.exe -c \"import sys; print\\(sys.executable\\)\" && D:\\\\anaconda\\\\envs\\\\ADSMPC-python\\\\python.exe setup.py clean && D:\\\\anaconda\\\\envs\\\\ADSMPC-python\\\\Scripts\\\\pip.exe install -e . --no-build-isolation')",
+      "Bash(python -c ' *)",
+      "Bash(python /tmp/write_bat.py)",
+      "Read(//c/Users/hp/AppData/Local/Temp/**)",
+      "Bash(python write_bat.py)",
+      "Bash(tee /d/桌面/加密rag/ADSMPC-python/csprng_build.log)",
+      "Bash(tee /d/桌面/加密rag/ADSMPC-python/csprng_build2.log)",
+      "Bash(tee /d/桌面/加密rag/ADSMPC-python/csprng_build3.log)",
+      "Bash(tee /d/桌面/加密rag/ADSMPC-python/csprng_build4.log)",
+      "Bash(cmd //c 'call \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && dumpbin /dependents \"D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\NssMPClib\\\\csprng\\\\torchcsprng\\\\_C.cp310-win_amd64.pyd\"')",
+      "Bash(python write_dump_bat.py)",
+      "Bash(cmd //c \"D:\\\\\\\\桌面\\\\\\\\加密rag\\\\\\\\ADSMPC-python\\\\\\\\NssMPClib\\\\\\\\csprng\\\\\\\\dump_deps.bat\")"
+    ]
+  }
+}

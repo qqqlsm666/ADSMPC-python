@@ -54,7 +54,7 @@ def append_flags(flags, flags_to_append):
 
 
 def get_extensions():
-    build_cuda = torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1"
+    build_cuda = (torch.cuda.is_available() or os.getenv("FORCE_CUDA", "0") == "1") and os.getenv("FORCE_CPU", "0") != "1"
 
     module_name = "torchcsprng"
 

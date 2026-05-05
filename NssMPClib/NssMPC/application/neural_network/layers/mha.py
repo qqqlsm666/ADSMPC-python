@@ -253,8 +253,16 @@ class SecBertEncoder(nn.Module):
         self.layer = nn.ModuleList([SecBertLayer(config) for _ in range(config['num_hidden_layers'])])
 
     def forward(self, hidden_states, attention_mask=None):
-        for layer_module in self.layer:
+        is_secure = isinstance(hidden_states, ArithmeticSecretSharing)
+        is_server = is_secure and PartyRuntime.party.type == 'server'
+        for idx, layer_module in enumerate(self.layer):
+            if is_server:
+                import time as _t
+                _start = _t.time()
+                print(f"  [Encoder] layer {idx}/{len(self.layer)} start ...", flush=True)
             hidden_states = layer_module(hidden_states, attention_mask)
+            if is_server:
+                print(f"  [Encoder] layer {idx} done in {_t.time()-_start:.1f}s", flush=True)
         return hidden_states
 
 class SecBertPooler(nn.Module):

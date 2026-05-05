@@ -7,7 +7,12 @@
 #  Copyright (c) 2024 XDU NSS lab,
 #  Licensed under the MIT license. See LICENSE in the project root for license information.
 
-import torchcsprng as csprng
+import torch
+
+try:
+    import torchcsprng as csprng
+except ImportError:
+    csprng = None
 
 
 class AES:
@@ -31,5 +36,31 @@ class AES:
         :return: The first dimension is the number of parallelizations (seeds), and the second dimension is the int64 required to carry bits of random numbers
         :rtype: torch.Tensor
         """
-        random_out = csprng.random_repeat(self.s, bits)
-        return random_out
+        if csprng is not None:
+            return csprng.random_repeat(self.s, bits)
+
+        # Fallback for demo environments without the torchcsprng C++ extension.
+        # This is not cryptographically secure.
+        seeds = self.s.detach().cpu().to(torch.int64)
+        if seeds.dim() == 0:
+            seeds = seeds.view(1, 1)
+        elif seeds.dim() == 1:
+            seeds = seeds.view(-1, 1)
+        else:
+            seeds = seeds.reshape(seeds.shape[0], -1)
+        cols = max(1, (bits + 63) // 64)
+        rows = []
+        for seed_row in seeds:
+            seed = int(seed_row[0].item())
+            for item in seed_row[1:]:
+                seed ^= int(item.item())
+            generator = torch.Generator(device='cpu')
+            generator.manual_seed(seed & 0xFFFFFFFFFFFFFFFF)
+            rows.append(torch.randint(
+                torch.iinfo(torch.int64).min,
+                torch.iinfo(torch.int64).max,
+                (cols,),
+                generator=generator,
+                dtype=torch.int64,
+            ))
+        return torch.stack(rows, dim=0)

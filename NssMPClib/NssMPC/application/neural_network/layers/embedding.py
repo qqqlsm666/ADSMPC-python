@@ -108,9 +108,29 @@ class SecBertEmbeddings(torch.nn.Module):
         # 1. 分别计算三种 embedding
         #    每个 one-hot 张量与对应的 embedding 权重矩阵相乘
         debugging = False
+        is_secure = isinstance(input_oh, ArithmeticSecretSharing)
+        from NssMPC.config.runtime import PartyRuntime
+        is_server = is_secure and PartyRuntime.party.type == 'server'
+
+        if is_server:
+            import time as _t
+            _t0 = _t.time()
+            print(f"  [Embeddings] words ({tuple(input_oh.shape)}) ...", flush=True)
         words_embeds = self.word_embeddings(input_oh)
+        if is_server:
+            print(f"  [Embeddings] words done in {_t.time()-_t0:.1f}s", flush=True)
+            _t0 = _t.time()
+            print(f"  [Embeddings] position ...", flush=True)
         position_embeds = self.position_embeddings(pos_oh)
+        if is_server:
+            print(f"  [Embeddings] position done in {_t.time()-_t0:.1f}s", flush=True)
+            _t0 = _t.time()
+            print(f"  [Embeddings] token_type ...", flush=True)
         token_type_embeds = self.token_type_embeddings(type_oh)
+        if is_server:
+            print(f"  [Embeddings] token_type done in {_t.time()-_t0:.1f}s", flush=True)
+            _t0 = _t.time()
+            print(f"  [Embeddings] LayerNorm ...", flush=True)
         #print("4")
         # 2. 将三种 embedding 相加
         #    这是 BERT embedding 的标准做法
@@ -128,6 +148,8 @@ class SecBertEmbeddings(torch.nn.Module):
                 print("ArithmeticSecretSharing before layer norm"+"="*30)
                 print(embeddings.restore().convert_to_real_field())
         embeddings = self.LayerNorm(embeddings)
+        if is_server:
+            print(f"  [Embeddings] LayerNorm done in {_t.time()-_t0:.1f}s", flush=True)
         if debugging:
             if isinstance(embeddings, torch.Tensor):
                 print("Tensor plain after layer norm"+"="*30)

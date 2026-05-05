@@ -3,8 +3,94 @@
 #  Licensed under the MIT license. See LICENSE in the project root for license information.
 
 import torch
-import torchcsprng
-from torchcsprng import PRG as AES_PRG
+
+try:
+    # Windows: torchcsprng 编译版的 _C.pyd 依赖 torch 的 DLL（c10/torch_cpu/torch_python），
+    # 但 Python 的 DLL 搜索路径不会自动包含 torch/lib，所以先把它加进去再 import。
+    import os as _os
+    _torch_lib_dir = _os.path.join(_os.path.dirname(torch.__file__), 'lib')
+    if hasattr(_os, 'add_dll_directory') and _os.path.isdir(_torch_lib_dir):
+        try:
+            _os.add_dll_directory(_torch_lib_dir)
+        except (FileNotFoundError, OSError):
+            pass
+    import torchcsprng
+    from torchcsprng import PRG as AES_PRG
+    HAS_TORCHCSPRNG = True
+except ImportError:
+    torchcsprng = None
+    HAS_TORCHCSPRNG = False
+
+    class AES_PRG:
+        """
+        Compatibility fallback used when torchcsprng cannot be built locally.
+
+        This uses torch.Generator and is not a cryptographically secure PRG.
+        It exists so demos and tests can run on Windows environments where the
+        old torchcsprng extension is incompatible with the installed PyTorch.
+        """
+
+        def __init__(self):
+            self.device = DEVICE
+            self.parallel_num = 0
+            self.generators = []
+
+        def set_seeds(self, seeds):
+            seeds = seeds.detach().cpu().to(torch.int64)
+            if seeds.dim() == 0:
+                seeds = seeds.view(1, 1)
+            elif seeds.dim() == 1:
+                seeds = seeds.view(-1, 1)
+            else:
+                seeds = seeds.reshape(seeds.shape[0], -1)
+            self.parallel_num = seeds.shape[0]
+            self.generators = []
+            for seed_row in seeds:
+                seed = int(seed_row[0].item())
+                for item in seed_row[1:]:
+                    seed ^= int(item.item())
+                generator = torch.Generator(device='cpu')
+                generator.manual_seed(seed & 0xFFFFFFFFFFFFFFFF)
+                self.generators.append(generator)
+
+        def bit_random(self, bits):
+            if self.parallel_num == 0:
+                return torch.empty(0, dtype=torch.int64, device=self.device)
+            cols = max(1, (bits + 63) // 64)
+            rows = [
+                torch.randint(
+                    torch.iinfo(torch.int64).min,
+                    torch.iinfo(torch.int64).max,
+                    (cols,),
+                    generator=generator,
+                    dtype=torch.int64,
+                )
+                for generator in self.generators
+            ]
+            out = torch.stack(rows, dim=0)
+            # Generators 只能在 cpu 上工作；如果调用方期望 DEVICE 上的 tensor 就要拷过去
+            if self.device != 'cpu':
+                out = out.to(self.device)
+            return out
+
+        def random(self, length):
+            if self.parallel_num == 0:
+                return torch.empty(0, dtype=torch.int64, device=self.device)
+            rows = [
+                torch.randint(
+                    torch.iinfo(torch.int64).min,
+                    torch.iinfo(torch.int64).max,
+                    (length,),
+                    generator=generator,
+                    dtype=torch.int64,
+                )
+                for generator in self.generators
+            ]
+            out = torch.stack(rows, dim=0)
+            if self.device != 'cpu':
+                out = out.to(self.device)
+            return out
+
 from NssMPC.common.ring.ring_tensor import RingTensor
 from NssMPC.config import DEVICE, data_type, DTYPE
 
@@ -181,7 +267,11 @@ class MT19937_PRG():
         :param seed: A seed used to initialize a random number generator
         :type seed: int
         """
-        self.generator = torchcsprng.create_mt19937_generator(seed)
+        if HAS_TORCHCSPRNG:
+            self.generator = torchcsprng.create_mt19937_generator(seed)
+        else:
+            self.generator = torch.Generator(device='cpu')
+            self.generator.manual_seed(int(seed) & 0xFFFFFFFFFFFFFFFF)
 
     def random(self, length, dtype=DTYPE):
         """

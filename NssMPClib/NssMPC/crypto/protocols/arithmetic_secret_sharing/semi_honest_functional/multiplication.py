@@ -46,16 +46,25 @@ def beaver_mul(x, y):
     num_elements = 1
     for dim in broadcast_shape:
         num_elements *= dim
-        
+
     party = PartyRuntime.party
     a, b, c = party.get_param(AssMulTriples, num_elements)
     a.dtype = b.dtype = c.dtype = x.dtype
-    
-    # 5. 把 1D 的三元组 Reshape 成 2D，以匹配压扁后的数据
-    # a, b, c 现在都是 [1024, 1]
-    a = a.reshape(x_flat.shape)
-    b = b.reshape(y_flat.shape)
-    c = c.reshape(x_flat.shape) # 结果形状跟随 x_flat
+
+    # 5. 把三元组对齐成 [num_elements, 1]
+    # 在 DEBUG_LEVEL=2 时，ParamProvider 仅返回 1 个 triple（非安全的 benchmark 路径），
+    # 此时不能直接 reshape 到 [num_elements, 1]，需要先把同一个 triple 广播复用。
+    # 对应安全性：c0 = a0 * b0，复制后仍满足 c_i = a_i * b_i，Beaver 协议正确性保留。
+    target_shape_x = x_flat.shape
+    target_shape_y = y_flat.shape
+    if a.numel() != num_elements:
+        a = a.flatten().reshape(1, 1).expand(target_shape_x).contiguous()
+        b = b.flatten().reshape(1, 1).expand(target_shape_y).contiguous()
+        c = c.flatten().reshape(1, 1).expand(target_shape_x).contiguous()
+    else:
+        a = a.reshape(target_shape_x)
+        b = b.reshape(target_shape_y)
+        c = c.reshape(target_shape_x)
 
     # 6. 执行 Beaver 协议 (现在所有张量都是 2D 的，不会报错)
     e = x_flat - a

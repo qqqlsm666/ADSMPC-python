@@ -47,6 +47,7 @@ class TCPServer(object):
         Starts the server in a separate thread to handle incoming connections.
         """
         self.listening_thread = threading.Thread(target=self.start_listening)
+        self.listening_thread.daemon = True
         self.listening_thread.start()
 
     def start_listening(self):

@@ -3,16 +3,15 @@
 #  Licensed under the MIT license. See LICENSE in the project root for license information.
 
 import os
-from importlib import resources
 
 __data_path = os.path.expanduser('~/.NssMPClib/')
 if not os.path.exists(__data_path):
     os.makedirs(__data_path)
 
 if not os.path.exists(__data_path + '/config.json'):
-    __resource_path = resources.files('NssMPC') / 'default_config.json'
+    __resource_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'default_config.json')
     try:
-        with __resource_path.open('rb') as __source_file:
+        with open(__resource_path, 'rb') as __source_file:
             __data = __source_file.read()
             with open(__data_path + '/config.json', 'wb') as __target_file:
                 __target_file.write(__data)

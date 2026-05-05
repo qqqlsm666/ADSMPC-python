@@ -4,6 +4,8 @@ import torch.nn.functional as F
 import threading
 import os
 import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+os.environ.setdefault("NSSMPC_PORT_OFFSET", str(20000 + os.getpid() % 20000))
 
 # 引入你的环境
 from NssMPC.config import DEVICE
@@ -12,7 +14,7 @@ from NssMPC.secure_model.mpc_party import SemiHonestCS
 from NssMPC.application.neural_network.party.neural_network_party import NeuralNetworkCS
 from NssMPC.config.runtime import PartyRuntime
 from NssMPC.application.neural_network.utils.converter import share_model, load_model, share_data
-from NssMPC.crypto.aux_parameter import AssMulTriples, DivKey, GeLUKey, Wrap, SigmaDICFKey, ReciprocalSqrtKey, TanhKey,MatmulTriples,B2AKey
+from NssMPC.crypto.aux_parameter import AssMulTriples, DivKey, GeLUKey, Wrap, SigmaDICFKey, ReciprocalSqrtKey, TanhKey,MatmulTriples,B2AKey,GrottoDICFKey
 from NssMPC.application.neural_network.layers.mha import SecBertModel
 
 # ==========================================
@@ -34,20 +36,22 @@ LEX_DOC_LEN = 24  # BM25路召回的文档长度
 TOTAL_SEQ = QUERY_LEN + SEM_DOC_LEN + LEX_DOC_LEN
 VOCAB_SIZE_BM25 = 100
 DEBUG = False
+GEN_NUM = int(os.getenv("NSSMPC_GEN_NUM", "10000"))
 
 
 def gen_params():
     print("=== [Init] 生成辅助参数 ===")
     if not os.path.exists('data'): os.makedirs('data')
-    AssMulTriples.gen_and_save(50000000, saved_name='2PCBeaver')
-    DivKey.gen_and_save(100000)
-    GeLUKey.gen_and_save(100000)
-    TanhKey.gen_and_save(100000)
+    AssMulTriples.gen_and_save(GEN_NUM, saved_name='2PCBeaver')
+    DivKey.gen_and_save(GEN_NUM)
+    GeLUKey.gen_and_save(GEN_NUM)
+    TanhKey.gen_and_save(GEN_NUM)
     #MatmulTriples.gen_and_save(10000)
-    Wrap.gen_and_save(10000000)
-    ReciprocalSqrtKey.gen_and_save(10000)
-    SigmaDICFKey.gen_and_save(100000)
-    B2AKey.gen_and_save(100000)
+    Wrap.gen_and_save(GEN_NUM)
+    ReciprocalSqrtKey.gen_and_save(GEN_NUM)
+    GrottoDICFKey.gen_and_save(GEN_NUM)
+    SigmaDICFKey.gen_and_save(GEN_NUM)
+    B2AKey.gen_and_save(GEN_NUM)
     print("=== [Init] 参数生成完成 ===\n")
 
 # ==========================================
@@ -217,11 +221,40 @@ def run_server():
         model = SecBertModel(BERT_CONFIG)
         for param in model.parameters():
             param.requires_grad = False
-        
+
+        # ===== 加载 bert-tiny 预训练权重，让 pooler 输出有数值意义 =====
+        weight_path = os.path.join(os.path.dirname(__file__), "bert_tiny_weights.pth")
+        if os.path.exists(weight_path):
+            print(f"[Server] 加载 bert-tiny 权重: {weight_path}")
+            state_dict = torch.load(weight_path, map_location=DEVICE)
+            state_dict.pop('embeddings.position_ids', None)
+            # 剥离 'bert.' 前缀
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('bert.'):
+                    new_state_dict[k[5:]] = v
+                else:
+                    new_state_dict[k] = v
+            # 暴力替换（强转 float32 避免 int64 截断归零）
+            missing = []
+            loaded = 0
+            for name, param in model.named_parameters():
+                if name in new_state_dict:
+                    param.data = new_state_dict[name].to(DEVICE).to(torch.float32)
+                    loaded += 1
+                else:
+                    missing.append(name)
+            print(f"[Server] 权重加载完成: loaded={loaded}, missing={len(missing)}")
+            if missing:
+                print(f"[Server] 缺失权重示例: {missing[:5]}")
+        else:
+            print(f"[Server] 警告: 未找到权重文件 {weight_path}, 使用零初始化（pooler 会输出 0）")
+        # ====================================================
+
         model_for_dummy = SecBertModel(BERT_CONFIG)
 
         print("[Server] 执行 Dummy Model 1 (Seq=8)...")
-        server.dummy_model(model_for_dummy) 
+        server.dummy_model(model_for_dummy)
 
         s_local, s_remote = share_model(model)
 

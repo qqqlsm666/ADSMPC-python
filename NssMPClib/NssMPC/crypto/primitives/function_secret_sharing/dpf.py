@@ -140,6 +140,17 @@ def prefix_parity_query(x: RingTensor, keys, party_id, prg_type=PRG_TYPE):
     t_last = party_id
 
     s_last = keys.s
+
+    # 兼容 DEBUG_LEVEL=2：keys.s 退化为 1D（单 key），需广播到 x 的 batch shape
+    # 之后 PRG 输出再 reshape 回 [*x_batch, cols]，与 x_shift_bit [*x_batch, 1] 自然广播
+    x_batch_shape = list(x.tensor.shape[:-1]) if x.tensor.dim() >= 2 else []
+    needs_broadcast = (s_last.dim() == 1 and len(x_batch_shape) > 0)
+    if needs_broadcast:
+        n_total = 1
+        for d_ in x_batch_shape:
+            n_total *= d_
+        s_last = s_last.unsqueeze(0).expand(n_total, s_last.shape[0]).contiguous()
+
     for i in range(x.bit_len):
         cw = keys.cw_list[i]
 
@@ -148,6 +159,12 @@ def prefix_parity_query(x: RingTensor, keys, party_id, prg_type=PRG_TYPE):
         t_cw_r = cw.t_cw_r
 
         s_l, t_l, s_r, t_r = CW.gen_dpf_cw(prg, s_last, LAMBDA)
+
+        if needs_broadcast:
+            s_l = s_l.reshape(*x_batch_shape, s_l.shape[-1])
+            s_r = s_r.reshape(*x_batch_shape, s_r.shape[-1])
+            t_l = t_l.reshape(*x_batch_shape, t_l.shape[-1])
+            t_r = t_r.reshape(*x_batch_shape, t_r.shape[-1])
 
         s1_l = s_l ^ (s_cw * t_last)
         t1_l = t_l ^ (t_cw_l * t_last)
@@ -163,6 +180,10 @@ def prefix_parity_query(x: RingTensor, keys, party_id, prg_type=PRG_TYPE):
 
         s_last = s1_r * x_shift_bit + s1_l * (1 - x_shift_bit)
         t_last = t1_r * x_shift_bit + t1_l * (1 - x_shift_bit)
+
+        if needs_broadcast:
+            # 下一轮 PRG 需要 2D 输入，把 batch dims 折回 parallel_num
+            s_last = s_last.reshape(-1, s_last.shape[-1])
 
     psg_b = (psg_b ^ t_last) * d + psg_b * (1 - d)
 
