@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+.Python
+build/
+dist/
+
+# Logs
+*.log
+
+# 加密 RAG 运行时生成的辅助参数（每次 gen_params 都会生成 64MB+ 数据）
+data/
+NssMPClib/data/CNN/CNN_MNIST.pkl
+NssMPClib/data/CNN/MNIST/
+~/.NssMPClib/
+
+# 实验结果输出
+experiments/results/*.md
+!experiments/results/.gitkeep
+
+# 大模型权重（除 models/ 下的）
+*.pth
+!models/*.pth
+!NssMPClib/test/*.pth
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+NssMPClib/csprng/build/
+NssMPClib/csprng/*.egg-info/

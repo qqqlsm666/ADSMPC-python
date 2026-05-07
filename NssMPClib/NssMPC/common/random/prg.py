@@ -112,10 +112,21 @@ class PRG(object):
             * **device** (*str*): parameter of apparatus(CPU or GPU)
             * **_prg** (*PRG*): AES_PRG instance
             * **dtype** (*Type*): The data type of the seed
+            * **_torchcsprng_cpu_only** (*bool*): True 表示当前 torchcsprng 编译为 CPU-only，
+              需在 set_seeds / bit_random 间做 cuda↔cpu 数据搬运
         """
         self.kernel = kernel
         self._prg = AES_PRG()
         self.dtype = None
+        # 检测当前 torchcsprng 是不是 CPU-only build（FORCE_CPU=1 编译的情况）
+        self._torchcsprng_cpu_only = False
+        if HAS_TORCHCSPRNG:
+            try:
+                self._torchcsprng_cpu_only = not bool(torchcsprng.supports_cuda)
+            except AttributeError:
+                self._torchcsprng_cpu_only = False
+        # 记录调用者期望的输出 device（fallback PRG 的 self.device 已是 DEVICE，这里和它对齐）
+        self._target_device = DEVICE
 
     @property
     def device(self):
@@ -152,9 +163,20 @@ class PRG(object):
         """
         if isinstance(seeds, RingTensor):
             self.dtype = seeds.dtype
-            self._prg.set_seeds(seeds.tensor.contiguous())
+            tensor = seeds.tensor.contiguous()
         elif isinstance(seeds, torch.Tensor):
-            self._prg.set_seeds(seeds.contiguous())
+            tensor = seeds.contiguous()
+        else:
+            return
+
+        # CPU-only torchcsprng 不能接受 cuda tensor，自动搬到 cpu；
+        # 同时记录调用者期望的输出 device，bit_random_tensor 末尾再搬回去
+        if self._torchcsprng_cpu_only and tensor.device.type != 'cpu':
+            self._target_device = str(tensor.device)
+            tensor = tensor.cpu()
+        else:
+            self._target_device = str(tensor.device)
+        self._prg.set_seeds(tensor)
 
     def bit_random_tensor(self, bits, device=None):
         """
@@ -171,8 +193,10 @@ class PRG(object):
         if self.parallel_num == 0:
             raise ValueError("seeds is None, please set seeds first!")
         gen = self._prg.bit_random(bits)
-        if device is not None and device != self.device:
-            gen = gen.to(device)
+        # 选择输出 device：优先用调用者指定的，其次回到 set_seeds 时记录的"期望 device"
+        target = device if device is not None else self._target_device
+        if target is not None and str(gen.device) != target:
+            gen = gen.to(target)
         return gen
 
     def random_tensor(self, length, device=None):
@@ -194,8 +218,9 @@ class PRG(object):
         if self.parallel_num == 0:
             raise ValueError("seeds is None, please set seeds first!")
         gen = self._prg.random(length)
-        if device is not None and device != self.device:
-            gen = gen.to(device)
+        target = device if device is not None else self._target_device
+        if target is not None and str(gen.device) != target:
+            gen = gen.to(target)
         return gen
 
     def bit_random(self, bits, dtype=None, device=None):

@@ -21,7 +21,10 @@
       "Bash(tee /d/桌面/加密rag/ADSMPC-python/csprng_build4.log)",
       "Bash(cmd //c 'call \"C:\\\\Program Files\\\\Microsoft Visual Studio\\\\2022\\\\Community\\\\VC\\\\Auxiliary\\\\Build\\\\vcvars64.bat\" >nul 2>&1 && dumpbin /dependents \"D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\NssMPClib\\\\csprng\\\\torchcsprng\\\\_C.cp310-win_amd64.pyd\"')",
       "Bash(python write_dump_bat.py)",
-      "Bash(cmd //c \"D:\\\\\\\\桌面\\\\\\\\加密rag\\\\\\\\ADSMPC-python\\\\\\\\NssMPClib\\\\\\\\csprng\\\\\\\\dump_deps.bat\")"
+      "Bash(cmd //c \"D:\\\\\\\\桌面\\\\\\\\加密rag\\\\\\\\ADSMPC-python\\\\\\\\NssMPClib\\\\\\\\csprng\\\\\\\\dump_deps.bat\")",
+      "Read(//d/桌面/加密rag/**)",
+      "Read(//d/桌面/加密rag//**)",
+      "Bash(python *)"
     ]
   }
 }
