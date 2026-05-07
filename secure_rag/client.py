@@ -48,6 +48,8 @@ def run_client(
     query_token_ids: Optional[torch.Tensor] = None,
     query_multihot: Optional[torch.Tensor] = None,
     bert_config: Optional[Dict] = None,
+    tokenizer=None,
+    return_holder: Optional[list] = None,
 ):
     """
     Args:
@@ -55,6 +57,9 @@ def run_client(
         query_token_ids: [1, SEQ] long，query 的 token id（含 [CLS] 等特殊 token）
         query_multihot:  [VOCAB_SIZE_BM25, 1] float，BM25 路用的多热向量
         bert_config:     BERT 模型配置 dict
+        tokenizer:       HuggingFace tokenizer 实例（可选；不传就只输出 token id 不 decode 文本）
+        return_holder:   若提供 list，会把最终结果 dict append 进去，含
+                         'pool', 'rerank_scores', 'answer_token_id', 'answer_text'
     """
     cfg = bert_config or BERT_CONFIG
 
@@ -158,22 +163,82 @@ def run_client(
         my_pos_share = s_pos_local[0]
         my_typ_share = s_typ_local[0]
 
-        # ---------- 6. 联合推理 ----------
+        # ---------- 6. 联合推理（拿 seq_out 用于 reader）----------
         print("[Client] 执行联合推理...")
-        _, pool = model(
+        seq_out, pool = model(
             my_joint_ids_share, my_pos_share, my_typ_share,
             RingTensor.convert_to_ring(joint_mask),
         )
 
-        # ---------- 7. 密态 Reranker（B2 方案）----------
-        # 与 server 对称：双方各自调一次 secure_rerank（内部 secure_matmul 会双向通信），
-        # 然后 client 把自己那一半 share 发给 server，server 端做 restore。
+        # ---------- 7. 密态 Reranker（双方对称调用一次 secure_matmul）----------
         print("[Client] 密态 reranker 计算 ...")
-        from .retrieval import secure_rerank
+        from .retrieval import secure_rerank, secure_reader
         rerank_logits_share = secure_rerank(pool, my_db_share)
-        client_party.send(rerank_logits_share)   # 先发 rerank（与 server 的 receive 顺序对齐）
 
-        # ---------- 8. 把 pool 发给 server 还原（保留兼容）----------
-        client_party.send(pool)
+        # ---------- 8. 密态 Reader（双方对称调用，内部含 top_k_indicator + gather）----------
+        print("[Client] 密态 reader 抽取答案 ...")
+        answer_token_oh_share, reader_logits_share, position_indicator_share = secure_reader(
+            pool, seq_out, my_joint_ids_share,
+        )
+
+        # ---------- 9. 接收 server 的三个 share，在 client 端 restore ----------
+        # 顺序与 server 端 send 严格对齐：rerank → pool → answer → reader_logits → position_indicator
+        print("[Client] 接收 server 端 share 并 restore ...")
+        s_rerank = client_party.receive()
+        final_rerank = ArithmeticSecretSharing.restore_from_shares(rerank_logits_share, s_rerank)
+        rerank_scores_real = final_rerank.convert_to_real_field().view(-1)         # [NUM_DOCS]
+
+        s_pool = client_party.receive()
+        final_pool = ArithmeticSecretSharing.restore_from_shares(pool, s_pool)
+        pool_real = final_pool.convert_to_real_field()                             # [1, hidden]
+
+        s_answer = client_party.receive()
+        final_answer = ArithmeticSecretSharing.restore_from_shares(answer_token_oh_share, s_answer)
+        answer_oh = final_answer.convert_to_real_field()                           # [1, V]
+        answer_token_id = int(answer_oh.argmax(dim=-1).item())
+
+        # 诊断信息（reader logits 与 position indicator）
+        s_reader_logits = client_party.receive()
+        final_reader_logits = ArithmeticSecretSharing.restore_from_shares(reader_logits_share, s_reader_logits)
+        reader_logits_real = final_reader_logits.convert_to_real_field().view(-1)  # [seq_len]
+
+        s_position = client_party.receive()
+        final_position = ArithmeticSecretSharing.restore_from_shares(position_indicator_share, s_position)
+        position_real = final_position.convert_to_real_field().view(-1)            # [seq_len]
+        answer_position = int(position_real.argmax().item())
+
+        # ---------- 10. 用 tokenizer decode 答案 token ----------
+        answer_text = None
+        if tokenizer is not None:
+            try:
+                answer_text = tokenizer.decode([answer_token_id]).strip()
+            except Exception as e:
+                answer_text = f"<decode_error: {e}>"
+
+        # ---------- 11. 打印 + 写出结果 ----------
+        print(f"\n=== [Client] Rerank 分数 (在 client 端 restore) ===")
+        print(f"shape={tuple(rerank_scores_real.shape)}, scores={rerank_scores_real.tolist()}")
+        rerank_top_k = torch.topk(rerank_scores_real, k=min(5, rerank_scores_real.shape[0])).indices
+        print(f"Rerank top-{rerank_top_k.shape[0]} doc id: {rerank_top_k.tolist()}")
+
+        print(f"\n=== [Client] 联合推理 Pooler 输出 (在 client 端 restore) ===")
+        print(f"shape={tuple(pool_real.shape)} first5: {pool_real[:, :5]}")
+        print(f"abs_max: {pool_real.abs().max().item()} mean: {pool_real.mean().item()}")
+
+        print(f"\n=== [Client] Reader 抽取答案 ===")
+        print(f"answer_position (在联合序列中的位置): {answer_position} / {position_real.shape[0]}")
+        print(f"answer_token_id: {answer_token_id}")
+        if answer_text is not None:
+            print(f"answer_text: {answer_text!r}")
+
+        if return_holder is not None:
+            return_holder.append({
+                'pool':              pool_real.detach().cpu(),
+                'rerank_scores':     rerank_scores_real.detach().cpu(),
+                'answer_token_id':   answer_token_id,
+                'answer_text':       answer_text,
+                'answer_position':   answer_position,
+                'reader_logits':     reader_logits_real.detach().cpu(),
+            })
 
     client_party.close()

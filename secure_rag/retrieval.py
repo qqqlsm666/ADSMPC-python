@@ -95,3 +95,70 @@ def secure_rerank(pool_share, db_embs_share):
     db_embs_T = db_embs_share.T                       # ASS [hidden, N_DOCS]
     rerank_logits = pool_share @ db_embs_T            # ASS [1, N_DOCS]
     return rerank_logits
+
+
+def secure_reader(pool_share, seq_out_share, joint_ids_share,
+                  query_len: int = 8,
+                  special_token_ids=(0, 101, 102),
+                  mask_value: float = 1000.0):
+    """
+    [Reader] 密态抽取式阅读器（启发式版 + special token mask）。
+
+    用启发式 head 实现"在联合输入序列里挑出答案 token"：
+      - reader_logits[i] = pool · seq_out[i]   (pool 跟每个位置的相关度)
+      - **mask 特殊位置 / 特殊 token，避免选到 [CLS]/[SEP]/[PAD] 或 query 段**
+      - 密态 argmax (复用 secure_top_k_indicator with K=1)
+      - 用密态 indicator 从 joint_ids 里 gather 出答案 token 的 one-hot
+
+    整个过程任意一方都不知道答案在第几位、答案是哪个 token。
+    最终输出 ASS [1, V] 的密态 token one-hot；只在 client 端 restore，
+    再用 tokenizer.decode 拿到自然语言答案。
+
+    Args:
+        pool_share:        ASS [1, hidden]            联合推理 pooler
+        seq_out_share:     ASS [1, seq_len, hidden]   联合推理 sequence output
+        joint_ids_share:   ASS [1, seq_len, vocab]    联合输入的 token one-hot
+        query_len:         前 query_len 个位置是 query（公开），不能是答案
+        special_token_ids: 这些 token 不能是答案（[PAD]=0, [CLS]=101, [SEP]=102）
+        mask_value:        被 mask 的位置 logits 减去这个常量，让其不可能赢得 argmax
+
+    Returns:
+        answer_token_oh_share: ASS [1, vocab] —— 密态 one-hot 答案 token
+        reader_logits_share:   ASS [1, seq_len] —— 密态 reader 分数（已含 mask 偏置；供调试）
+        position_indicator_share: ASS [1, seq_len] —— 密态答案位置指示器（供调试）
+    """
+    # 1) 计算密态 reader logits = sum_d (seq_out[i, d] * pool[d])  ↔  内积
+    #    seq_out_share: [1, L, h]; pool_share.unsqueeze(1): [1, 1, h]
+    #    广播按位乘后 [1, L, h] → sum(-1) → [1, L]
+    reader_logits = (seq_out_share * pool_share.unsqueeze(1)).sum(dim=-1)   # ASS [1, L]
+
+    # 1.5) Mask：让 query 段、[CLS]/[SEP]/[PAD] 位置都不可能赢
+    L = reader_logits.shape[-1]
+
+    # (a) 明文 mask：query 段位置 0..query_len-1（公开，所有方一致）
+    plain_mask = torch.zeros(1, L, device=DEVICE)
+    if query_len > 0:
+        plain_mask[:, :query_len] = -mask_value
+    plain_mask_ring = RingTensor.convert_to_ring(plain_mask)
+    reader_logits = reader_logits + plain_mask_ring                          # ASS + RingTensor
+
+    # (b) 密态 mask：joint_ids_share[..., tok_id] 是 [1, L] 的 ASS one-hot，
+    #     聚合 special token 形成 indicator，乘 -mask_value 加到 logits 上
+    if special_token_ids:
+        special_indicator = None
+        for tok_id in special_token_ids:
+            ind = joint_ids_share[..., tok_id]                               # ASS [1, L]
+            special_indicator = ind if special_indicator is None else (special_indicator + ind)
+        reader_logits = reader_logits + special_indicator * (-mask_value)    # ASS * 明文常量
+
+    # 2) 密态 argmax：把 reader_logits view 成 [L]，复用 secure_top_k_indicator
+    position_indicator = secure_top_k_indicator(reader_logits.view(-1), k=1)  # ASS [1, L]
+
+    # 3) 密态 gather：用 indicator 从 joint_ids 的 seq 维度上"挑"出答案 token
+    #    position_indicator: [1, L] → [1, L, 1]
+    #    joint_ids_share:    [1, L, V]
+    #    乘 + sum(dim=1) → [1, V]   即被选中那一行的 token one-hot
+    expanded_ind = position_indicator.unsqueeze(-1)                          # ASS [1, L, 1]
+    answer_token_oh = (expanded_ind * joint_ids_share).sum(dim=1)            # ASS [1, V]
+
+    return answer_token_oh, reader_logits, position_indicator

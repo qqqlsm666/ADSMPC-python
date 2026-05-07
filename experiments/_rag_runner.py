@@ -40,13 +40,22 @@ def run_secure_rag_once(
     device: Optional[str] = None,
     timeout_sec: int = 600,
     show_subprocess_output: bool = True,
+    tokenizer_name: Optional[str] = None,
 ) -> Dict[str, torch.Tensor]:
     """起子进程跑一次完整加密 RAG。
 
+    Args:
+        tokenizer_name: 传给子进程的 tokenizer 名（如 'bert-base-uncased'）。子进程加载后
+                       传给 run_client 用于 decode 答案 token。None 则不 decode。
+
     Returns:
         dict 包含
-            - 'pool':          [1, hidden] 联合推理 pooler 输出（密态还原后的明文）
-            - 'rerank_scores': [NUM_DOCS]   reranker 重排序分数（密态还原后的明文）
+            - 'pool':            [1, hidden] 联合推理 pooler 输出（client 端 restore 后的明文）
+            - 'rerank_scores':   [NUM_DOCS] reranker 重排序分数（client 端 restore）
+            - 'answer_token_id': int answer token id
+            - 'answer_text':     str | None answer 文本
+            - 'answer_position': int 答案在联合序列中的位置 (0..55)
+            - 'reader_logits':   [seq_len] reader logits（诊断用）
     """
     global _call_counter
     _call_counter += 1
@@ -61,6 +70,7 @@ def run_secure_rag_once(
         'db_tokens_onehot':  db_tokens_onehot,
         'weight_path':       weight_path,
         'bert_config':       bert_config,
+        'tokenizer_name':    tokenizer_name,
     }
     if device is not None:
         payload['device'] = device
@@ -104,11 +114,10 @@ def run_secure_rag_once(
             result = pickle.load(f)
         if not result.get('ok'):
             raise RuntimeError(f"子进程报错: {result.get('error')}")
-        # 返回完整 dict，调用方拿什么取什么
-        return {
-            'pool':          result['pool'],
-            'rerank_scores': result['rerank_scores'],
-        }
+        # 透传子进程写出的所有字段（pool / rerank_scores / answer_token_id /
+        # answer_text / answer_position / reader_logits）
+        result.pop('ok', None)
+        return result
 
     finally:
         for p in (input_path, output_path):

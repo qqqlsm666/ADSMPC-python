@@ -230,14 +230,32 @@ def plaintext_rag(
     oh_joint_pos = F.one_hot(joint_pos, cfg['max_position_embeddings']).float()
     oh_joint_typ = F.one_hot(joint_typ, cfg['type_vocab_size']).float()
 
-    # ---------- 6. 联合推理 ----------
-    _, pool = bert_model(joint_ids_oh, oh_joint_pos, oh_joint_typ, joint_mask)     # [1, hidden]
+    # ---------- 6. 联合推理（拿 sequence output 给 reader 用）----------
+    seq_out, pool = bert_model(joint_ids_oh, oh_joint_pos, oh_joint_typ, joint_mask)  # seq: [1, L, h], pool: [1, h]
 
     # ---------- 7. Reranker（与 secure_rag.server.py 对齐）----------
     # pool [1, hidden] @ db_embeddings.T [hidden, n_docs] = [1, n_docs] reranker 分数
     rerank_scores = (pool @ db_embeddings.T).view(-1)                              # [n_docs]
     rerank_top_k = min(top_k, n_docs)
     rerank_top_k_idx = torch.topk(rerank_scores, k=rerank_top_k).indices            # [k]
+
+    # ---------- 8. Reader（与 secure_rag.retrieval.secure_reader 对齐）----------
+    # 启发式 head: reader_logits[i] = pool · seq_out[i]
+    reader_logits = (seq_out * pool.unsqueeze(1)).sum(dim=-1).view(-1)             # [L]
+    # Mask：query 段（位置 0..QUERY_LEN-1）+ special token (PAD=0, CLS=101, SEP=102)
+    # 让 reader 只在 doc 段的实词中产生答案
+    mask_value = 1000.0
+    if QUERY_LEN > 0:
+        reader_logits[:QUERY_LEN] = reader_logits[:QUERY_LEN] - mask_value
+    joint_token_ids = joint_ids_oh[0].argmax(dim=-1)                               # [L]
+    for special_id in (0, 101, 102):
+        reader_logits = reader_logits - (joint_token_ids == special_id).float() * mask_value
+    answer_position = int(reader_logits.argmax().item())
+    # 从 joint_ids_oh 的 seq 维度上取出答案 token
+    answer_token_oh = joint_ids_oh[0, answer_position]                              # [V]
+    answer_token_id = int(answer_token_oh.argmax().item())
+    # decode：默认不做（实验脚本里有 tokenizer 时会做）
+    answer_text = None
 
     return {
         'pool':              pool.detach().cpu(),
@@ -248,4 +266,8 @@ def plaintext_rag(
         'query_emb':         query_emb.detach().cpu(),
         'rerank_scores':     rerank_scores.detach().cpu(),
         'rerank_top_k_idx':  rerank_top_k_idx.detach().cpu(),
+        'reader_logits':     reader_logits.detach().cpu(),
+        'answer_position':   answer_position,
+        'answer_token_id':   answer_token_id,
+        'answer_text':       answer_text,
     }

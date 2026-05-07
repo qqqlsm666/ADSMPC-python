@@ -127,9 +127,13 @@ def main():
         bm25_matrix=bm25_matrix,
         db_tokens_onehot=docs_onehot,
         weight_path=weight_path,
+        tokenizer_name='bert-base-uncased',
     )
-    cipher_pool = cipher_out['pool']                                 # [1, hidden]
-    cipher_rerank = cipher_out['rerank_scores']                      # [NUM_DOCS]
+    cipher_pool = cipher_out['pool']                                       # [1, hidden]
+    cipher_rerank = cipher_out['rerank_scores']                            # [NUM_DOCS]
+    cipher_answer_id = cipher_out.get('answer_token_id')
+    cipher_answer_text = cipher_out.get('answer_text')
+    cipher_answer_pos = cipher_out.get('answer_position')
     cipher_time = time.time() - t0
     print(f"      密态 RAG 耗时 {cipher_time:.2f}s")
 
@@ -159,6 +163,29 @@ def main():
     rerank_top1_plain = int(plain_out['rerank_top_k_idx'][0].item())
     rerank_top1_cipher = int(torch.topk(cipher_rerank_f, k=1).indices[0].item())
 
+    # Reader 答案一致性
+    plain_answer_id = plain_out.get('answer_token_id')
+    plain_answer_pos = plain_out.get('answer_position')
+    # 用 tokenizer 给明文也 decode 一份答案
+    plain_answer_text = None
+    try:
+        from experiments.data_loader import _try_load_tokenizer
+        _tok = _try_load_tokenizer('bert-base-uncased')
+        plain_answer_text = _tok.decode([plain_answer_id]).strip() if plain_answer_id is not None else None
+    except Exception:
+        pass
+
+    # Reader 一致性指标
+    answer_position_match = (plain_answer_pos == cipher_answer_pos)
+    answer_token_match = (plain_answer_id == cipher_answer_id)
+    # 跟 ground truth 比对
+    gt_answers = data['corpus']['queries'][q_idx].get('answer', [])
+    from experiments.metrics import exact_match, partial_match, token_f1
+    plain_em = exact_match(plain_answer_text or '', gt_answers)
+    cipher_em = exact_match(cipher_answer_text or '', gt_answers)
+    plain_pm = partial_match(plain_answer_text or '', gt_answers)
+    cipher_pm = partial_match(cipher_answer_text or '', gt_answers)
+
     md = build_report(
         query_idx=q_idx,
         query_text=query_text,
@@ -180,6 +207,19 @@ def main():
         cipher_pool=cipher_pool,
         plain_rerank=plain_rerank,
         cipher_rerank=cipher_rerank_f,
+        plain_answer_pos=plain_answer_pos,
+        cipher_answer_pos=cipher_answer_pos,
+        plain_answer_id=plain_answer_id,
+        cipher_answer_id=cipher_answer_id,
+        plain_answer_text=plain_answer_text,
+        cipher_answer_text=cipher_answer_text,
+        answer_position_match=answer_position_match,
+        answer_token_match=answer_token_match,
+        gt_answers=gt_answers,
+        plain_em=plain_em,
+        cipher_em=cipher_em,
+        plain_pm=plain_pm,
+        cipher_pm=cipher_pm,
     )
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
@@ -200,18 +240,26 @@ def build_report(*, query_idx, query_text, gt, n_docs, plain_time, cipher_time,
                  pool_max_diff, pool_mean_diff, pool_cos,
                  rerank_max_diff, rerank_mean_diff, rerank_cos,
                  sem_top1, lex_top1, rerank_top1_plain, rerank_top1_cipher,
-                 plain_pool, cipher_pool, plain_rerank, cipher_rerank):
+                 plain_pool, cipher_pool, plain_rerank, cipher_rerank,
+                 plain_answer_pos, cipher_answer_pos,
+                 plain_answer_id, cipher_answer_id,
+                 plain_answer_text, cipher_answer_text,
+                 answer_position_match, answer_token_match,
+                 gt_answers, plain_em, cipher_em, plain_pm, cipher_pm):
     rerank_top1_match = rerank_top1_plain == rerank_top1_cipher
     rerank_hit_plain = rerank_top1_plain == gt
     rerank_hit_cipher = rerank_top1_cipher == gt
-    return f"""# 数值一致性对比 (Numerical Compare) — B2 方案 (含密态 reranker)
+    return f"""# 数值一致性对比 (Numerical Compare) — B2 + Reader 方案
 
 ## 实验设置
 - Query #{query_idx}: `{query_text}`
 - Ground truth doc id: {gt}
+- Ground truth answers: {gt_answers}
 - 文档库大小: {n_docs}
 - BERT 配置: bert-tiny (2 层、hidden=128、vocab=30522)
 - Reranker: pool [1,128] @ db_embs.T [128,N_DOCS] (密态 ASS@ASS matmul)
+- Reader: 启发式 head (pool · seq_out → 密态 argmax → 密态 gather token)
+- 输出方向：rerank/pool/answer 均在 client 端 restore（server 不学习任何客户端结果）
 
 ## 性能
 | 指标 | 明文 RAG | 密态 RAG |
@@ -225,7 +273,7 @@ def build_report(*, query_idx, query_text, gt, n_docs, plain_time, cipher_time,
 | `mean_diff` | {pool_mean_diff:.4f} | 平均绝对误差 |
 | `cosine_sim` | {pool_cos:.6f} | 越接近 1 越一致 |
 
-## Rerank 分数一致性 (核心指标 — 直接决定最终检索结果)
+## Rerank 分数一致性 (Cross-Encoder Reranker)
 | 指标 | 数值 | 含义 |
 |---|---|---|
 | `max_diff` | {rerank_max_diff:.4f} | reranker 各维分数的最大误差 |
@@ -235,12 +283,27 @@ def build_report(*, query_idx, query_text, gt, n_docs, plain_time, cipher_time,
 ## Top-1 检索一致性
 | 路径 | 选中 doc id | gt | 命中? |
 |---|---|---|---|
-| 明文双路·语义 top-1 | {sem_top1} | {gt} | {'✅' if sem_top1 == gt else '❌'} |
-| 明文双路·词汇 top-1 | {lex_top1} | {gt} | {'✅' if lex_top1 == gt else '❌'} |
-| **明文 Reranker top-1** | **{rerank_top1_plain}** | {gt} | **{'✅' if rerank_hit_plain else '❌'}** |
-| **密态 Reranker top-1** | **{rerank_top1_cipher}** | {gt} | **{'✅' if rerank_hit_cipher else '❌'}** |
+| 明文双路·语义 top-1 | {sem_top1} | {gt} | {'YES' if sem_top1 == gt else 'NO'} |
+| 明文双路·词汇 top-1 | {lex_top1} | {gt} | {'YES' if lex_top1 == gt else 'NO'} |
+| **明文 Reranker top-1** | **{rerank_top1_plain}** | {gt} | **{'YES' if rerank_hit_plain else 'NO'}** |
+| **密态 Reranker top-1** | **{rerank_top1_cipher}** | {gt} | **{'YES' if rerank_hit_cipher else 'NO'}** |
 
-明文 vs 密态 reranker top-1 是否一致：**{'✅ 一致' if rerank_top1_match else '❌ 不一致'}**
+明文 vs 密态 reranker top-1 是否一致：**{'YES' if rerank_top1_match else 'NO'}**
+
+## Reader 抽取式生成结果
+
+| 维度 | 明文 RAG | 密态 RAG |
+|---|---|---|
+| 答案位置 (在长 56 联合序列中) | {plain_answer_pos} | {cipher_answer_pos} |
+| 答案 token id | {plain_answer_id} | {cipher_answer_id} |
+| 答案文本 | `{plain_answer_text}` | `{cipher_answer_text}` |
+| EM (严格)  | {plain_em:.2f} | {cipher_em:.2f} |
+| Partial Match (子串放宽) | {plain_pm:.2f} | {cipher_pm:.2f} |
+
+| 一致性维度 | 结果 |
+|---|---|
+| 明文 vs 密态 答案位置一致 | {'YES' if answer_position_match else 'NO'} |
+| 明文 vs 密态 答案 token 一致 | {'YES' if answer_token_match else 'NO'} |
 
 ## Pool 输出预览
 ```
@@ -258,7 +321,9 @@ def build_report(*, query_idx, query_text, gt, n_docs, plain_time, cipher_time,
 - Pool 一致性 cosine_sim={pool_cos:.4f}
 - Rerank 一致性 cosine_sim={rerank_cos:.4f}
 - 明文/密态 reranker top-1 一致：{rerank_top1_match}
+- 明文/密态 Reader 答案 token 一致：{answer_token_match}
 - 加密延迟代价：×{cipher_time / max(plain_time, 1e-6):.1f}
+- **隐私保证**：所有结果（rerank、pool、answer）均仅在 client 端 restore，server 全程不学习客户端的查询、检索结果或答案。
 """
 
 

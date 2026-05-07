@@ -166,37 +166,39 @@ def run_server(
 
         # ---------- 6. 联合推理 ----------
         print("[Server] 执行联合推理...")
-        _, pool = model(my_joint_ids_share, my_pos_share, my_typ_share, joint_mask)
+        seq_out, pool = model(my_joint_ids_share, my_pos_share, my_typ_share, joint_mask)
 
         # ---------- 7. 密态 Reranker（B2 方案）----------
         # 把联合推理产出的 pool 跟原始文档语义库做密态 matmul，得到每篇 doc 的精排分数。
-        # pool 之前没下游 head，纯属"装饰"；现在用作 cross-encoder 的融合表示。
         print("[Server] 密态 reranker 计算 ...")
-        from .retrieval import secure_rerank
+        from .retrieval import secure_rerank, secure_reader
         rerank_logits_share = secure_rerank(pool, my_db_share)
 
-        c_rerank = server_party.receive()
-        final_rerank = ArithmeticSecretSharing.restore_from_shares(rerank_logits_share, c_rerank)
-        final_rerank_real = final_rerank.convert_to_real_field().view(-1)            # [NUM_DOCS]
-        print(f"\n=== [Server] Rerank 分数 ===")
-        print(f"shape={tuple(final_rerank_real.shape)}, scores={final_rerank_real.tolist()}")
-        # 注意：top-K 这里取的是 reranker 的 final 排序，不是双路初次 top-K
-        rerank_top_k = torch.topk(final_rerank_real, k=min(5, final_rerank_real.shape[0])).indices
-        print(f"Rerank top-{rerank_top_k.shape[0]} doc id: {rerank_top_k.tolist()}")
+        # ---------- 8. 密态 Reader（抽取式生成）----------
+        # 启发式 head: pool · seq_out → reader logits → 密态 argmax → 密态 gather token
+        # 整条流程双方都看不到答案位置或答案 token，最后只在 client 端 restore。
+        print("[Server] 密态 reader 抽取答案 ...")
+        answer_token_oh_share, reader_logits_share, position_indicator_share = secure_reader(
+            pool, seq_out, my_joint_ids_share,
+        )
 
-        # ---------- 8. 还原 pool（保留兼容性）----------
-        c_pool = server_party.receive()
-        final_pool = ArithmeticSecretSharing.restore_from_shares(pool, c_pool)
-        final_pool_real = final_pool.convert_to_real_field()
-        print("\n=== [Server] 联合推理 Pooler 输出 ===")
-        print(f"shape={tuple(final_pool_real.shape)} dtype={final_pool_real.dtype}")
-        print(f"first5: {final_pool_real[:, :5]}")
-        print(f"abs_max: {final_pool_real.abs().max().item()} mean: {final_pool_real.mean().item()}")
+        # ---------- 9. 输出方向反转：三个 share 全部 send 给 client，client 端 restore ----------
+        # 这样 server 全程不学习到 query 相关的信息：reranker 分数、pool 数值、答案 token 都
+        # 在 client 端还原。Server 只持有自己的文档库（本来就有），不学习客户端的查询、检索结果或答案。
+        print("[Server] 把 rerank / pool / answer 三个 share 发给 client ...")
+        server_party.send(rerank_logits_share)   # client 端 restore 拿到精排分数
+        server_party.send(pool)                  # client 端 restore 拿到 pool（实验数值一致性用）
+        server_party.send(answer_token_oh_share) # client 端 restore 拿到答案 token one-hot
+
+        # 实验诊断：把 server 端持有的 share（不是明文）写出去，便于 client 端做数值一致性对比时
+        # 拿到 server 端的 reader_logits / position_indicator share 也能在 client 端 restore。
+        # 不过这两个用于诊断而非最终输出，所以也走 send。
+        server_party.send(reader_logits_share)
+        server_party.send(position_indicator_share)
 
         if return_holder is not None:
-            return_holder.append({
-                'pool':          final_pool_real.detach().cpu(),
-                'rerank_scores': final_rerank_real.detach().cpu(),
-            })
+            # Server 端不再持有最终结果（已经全部送给 client）；这里只填空 dict 占位，
+            # 真正的结果由 client 端的 run_client 写出。
+            return_holder.append({})
 
     server_party.close()

@@ -85,20 +85,25 @@ def per_query_metrics(retrieved: List[int], relevant: List[int], ks: List[int]) 
     return out
 
 
-def run_plaintext_pass(data, plain_bert, db_embeddings, bm25_matrix, n_docs, ks):
+def run_plaintext_pass(data, plain_bert, db_embeddings, bm25_matrix, n_docs, ks, tokenizer=None):
     """对所有 gt_doc_id < n_docs 的 query 跑明文 RAG。
 
     使用 reranker 的 top-K 作为最终 retrieved（与密态侧对齐）。
+    同时返回每条 query 的 reader 答案（用于 EM/PM 评估）。
     """
+    from secure_rag.plaintext import plaintext_rag
+    from experiments.metrics import exact_match, partial_match, token_f1
     queries_token_ids = data['queries_token_ids']
     query_multihots   = data['query_multihots']
     docs_onehot       = data['docs_onehot'][:n_docs]
     gt_doc_ids        = data['gt_doc_ids']
+    queries_meta      = data['corpus']['queries']
 
     n_queries = queries_token_ids.shape[0]
     per_q_metrics = []
     retrieved_list = []
     eval_indices = []
+    answers_info = []  # 每条 query 的 (gt_answers, plain_answer_text, em, pm)
     for q_idx in range(n_queries):
         if gt_doc_ids[q_idx] >= n_docs:
             continue
@@ -112,12 +117,35 @@ def run_plaintext_pass(data, plain_bert, db_embeddings, bm25_matrix, n_docs, ks)
             device='cpu',
             top_k=max(ks),
         )
-        # 用 reranker 输出做最终 retrieved（max(ks) 长度）
         retrieved = out['rerank_scores'].argsort(descending=True).tolist()[:max(ks)]
         retrieved_list.append(retrieved)
-        per_q_metrics.append(per_query_metrics(retrieved, [gt_doc_ids[q_idx]], ks))
+        m = per_query_metrics(retrieved, [gt_doc_ids[q_idx]], ks)
+
+        # Reader EM
+        gt_answers = queries_meta[q_idx].get('answer', [])
+        ans_id = out.get('answer_token_id')
+        ans_text = None
+        if tokenizer is not None and ans_id is not None:
+            try:
+                ans_text = tokenizer.decode([ans_id]).strip()
+            except Exception:
+                ans_text = None
+        em = exact_match(ans_text or '', gt_answers)
+        pm = partial_match(ans_text or '', gt_answers)
+        f1 = token_f1(ans_text or '', gt_answers)
+        m['EM']  = em
+        m['PM']  = pm
+        m['F1']  = f1
+        answers_info.append({
+            'q_idx': q_idx,
+            'gt': gt_answers,
+            'predicted_text': ans_text,
+            'predicted_id': ans_id,
+            'em': em, 'pm': pm,
+        })
+        per_q_metrics.append(m)
         eval_indices.append(q_idx)
-    return retrieved_list, per_q_metrics, eval_indices
+    return retrieved_list, per_q_metrics, eval_indices, answers_info
 
 
 def run_cipher_pass(data, weight_path, db_embeddings, bm25_matrix, n_docs, ks, num_queries, eval_indices=None):
@@ -126,10 +154,12 @@ def run_cipher_pass(data, weight_path, db_embeddings, bm25_matrix, n_docs, ks, n
     密态侧的 retrieved 直接用 secure_rag 的 reranker 输出（rerank_scores 取 argsort）。
     单条 query 失败（子进程超时 / 报错）会被跳过，不阻塞整体评估。
     """
+    from experiments.metrics import exact_match, partial_match, token_f1
     queries_token_ids = data['queries_token_ids']
     query_multihots   = data['query_multihots']
     docs_onehot       = data['docs_onehot'][:n_docs]
     gt_doc_ids        = data['gt_doc_ids']
+    queries_meta      = data['corpus']['queries']
 
     if eval_indices is None:
         eval_indices = [i for i in range(queries_token_ids.shape[0]) if gt_doc_ids[i] < n_docs]
@@ -137,6 +167,7 @@ def run_cipher_pass(data, weight_path, db_embeddings, bm25_matrix, n_docs, ks, n
 
     per_q_metrics = []
     retrieved_list = []
+    answers_info = []
     failed = []
     for n, q_idx in enumerate(eval_indices):
         print(f"\n--- 密态 RAG 第 {n + 1}/{len(eval_indices)} 条 query (idx={q_idx}) ---")
@@ -149,7 +180,8 @@ def run_cipher_pass(data, weight_path, db_embeddings, bm25_matrix, n_docs, ks, n
                 bm25_matrix=bm25_matrix,
                 db_tokens_onehot=docs_onehot,
                 weight_path=weight_path,
-                timeout_sec=180,
+                timeout_sec=240,
+                tokenizer_name='bert-base-uncased',
             )
             elapsed = time.time() - t0
             print(f"     一条耗时 {elapsed:.1f}s")
@@ -159,15 +191,33 @@ def run_cipher_pass(data, weight_path, db_embeddings, bm25_matrix, n_docs, ks, n
             failed.append((q_idx, str(e)))
             continue
 
-        # 直接用 reranker 输出；不再依赖明文 cosine 比对
         rerank_scores = cipher_out['rerank_scores'].view(-1)
         retrieved = rerank_scores.argsort(descending=True).tolist()[:max(ks)]
         retrieved_list.append(retrieved)
-        per_q_metrics.append(per_query_metrics(retrieved, [gt_doc_ids[q_idx]], ks))
+        m = per_query_metrics(retrieved, [gt_doc_ids[q_idx]], ks)
+
+        # Reader EM
+        gt_answers = queries_meta[q_idx].get('answer', [])
+        ans_text = cipher_out.get('answer_text')
+        ans_id = cipher_out.get('answer_token_id')
+        em = exact_match(ans_text or '', gt_answers)
+        pm = partial_match(ans_text or '', gt_answers)
+        f1 = token_f1(ans_text or '', gt_answers)
+        m['EM']  = em
+        m['PM']  = pm
+        m['F1']  = f1
+        answers_info.append({
+            'q_idx': q_idx,
+            'gt': gt_answers,
+            'predicted_text': ans_text,
+            'predicted_id': ans_id,
+            'em': em, 'pm': pm,
+        })
+        per_q_metrics.append(m)
 
     if failed:
         print(f"\n[密态 RAG] 共 {len(failed)} 条 query 失败：{[idx for idx, _ in failed]}")
-    return retrieved_list, per_q_metrics
+    return retrieved_list, per_q_metrics, answers_info
 
 
 def main():
@@ -201,10 +251,18 @@ def main():
     bm25_matrix = build_bm25_matrix(data['docs_token_ids'][:n_docs], data['bm25_vocab'])
 
     # ---------- 4. 明文 + 密态 ----------
+    # 加载 tokenizer 给 plaintext reader decode
+    from experiments.data_loader import _try_load_tokenizer
+    tokenizer = None
+    try:
+        tokenizer = _try_load_tokenizer('bert-base-uncased')
+    except Exception as e:
+        print(f"[Warn] tokenizer 加载失败，明文侧 reader 答案不会 decode: {e}")
+
     print(f"[4/5] 跑明文 RAG（gt_doc_id < {n_docs} 的全部 query）")
     t0 = time.time()
-    plain_retrieved, plain_per_q, eval_indices = run_plaintext_pass(
-        data, plain_bert, db_embeddings, bm25_matrix, n_docs, ks,
+    plain_retrieved, plain_per_q, eval_indices, plain_answers = run_plaintext_pass(
+        data, plain_bert, db_embeddings, bm25_matrix, n_docs, ks, tokenizer=tokenizer,
     )
     plain_total_time = time.time() - t0
     plain_avg = aggregate(plain_per_q)
@@ -213,12 +271,12 @@ def main():
     print(f"     明文阶段总耗时 {plain_total_time:.2f}s, "
           f"平均: {{ {', '.join(f'{k}={v:.3f}' for k, v in plain_avg.items())} }}")
 
-    cipher_avg, cipher_total_time, cipher_per_q = None, 0.0, []
+    cipher_avg, cipher_total_time, cipher_per_q, cipher_answers = None, 0.0, [], []
     if not args.skip_cipher:
         n_cipher = min(args.num_queries, len(eval_indices))
         print(f"[5/5] 跑密态 RAG（前 {n_cipher} 条 query，预计 {n_cipher * 1.5:.0f} 分钟）")
         t0 = time.time()
-        _, cipher_per_q = run_cipher_pass(
+        _, cipher_per_q, cipher_answers = run_cipher_pass(
             data, weight_path, db_embeddings, bm25_matrix, n_docs, ks, n_cipher,
             eval_indices=eval_indices,
         )
@@ -238,6 +296,8 @@ def main():
         ks=ks,
         plain_avg=plain_avg,
         cipher_avg=cipher_avg,
+        plain_answers=plain_answers,
+        cipher_answers=cipher_answers,
     )
     os.makedirs(os.path.dirname(args.output), exist_ok=True)
     with open(args.output, "w", encoding='utf-8') as f:
@@ -252,7 +312,7 @@ def main():
 
 
 def build_report(*, n_docs, n_q_plain, n_q_cipher, plain_total_time, cipher_total_time,
-                 ks, plain_avg, cipher_avg):
+                 ks, plain_avg, cipher_avg, plain_answers=None, cipher_answers=None):
     plain_row = lambda k, name: f"{plain_avg[name]:.4f}" if plain_avg.get(name) is not None else "-"
     cipher_row = lambda k, name: (f"{cipher_avg[name]:.4f}" if (cipher_avg and cipher_avg.get(name) is not None) else "-")
 
@@ -262,18 +322,35 @@ def build_report(*, n_docs, n_q_plain, n_q_cipher, plain_total_time, cipher_tota
         rows.append((f"Precision@{k}", f"P@{k}"))
         rows.append((f"NDCG@{k}", f"NDCG@{k}"))
     rows.append(("MRR", "MRR"))
+    rows.append(("Reader EM (严格)", "EM"))
+    rows.append(("Reader Partial Match (子串放宽)", "PM"))
+    rows.append(("Reader Token F1", "F1"))
 
     table_md = "| 指标 | 明文 RAG | 密态 RAG |\n|---|---|---|\n"
     for label, name in rows:
         table_md += f"| {label} | {plain_row(0, name)} | {cipher_row(0, name)} |\n"
 
-    return f"""# 检索质量对比 (Retrieval Eval) — B2 方案 (含密态 reranker)
+    # Reader 答案明细表
+    answers_md = ""
+    if plain_answers and cipher_answers:
+        answers_md = "\n## Reader 答案明细（每条 query 的答案对照）\n\n"
+        answers_md += "| q_idx | gt | 明文预测 | 密态预测 | 明文 EM | 密态 EM |\n|---|---|---|---|---|---|\n"
+        for pa, ca in zip(plain_answers, cipher_answers):
+            gt_str = '/'.join(pa.get('gt', []))[:30]
+            answers_md += (f"| {pa['q_idx']} | {gt_str} | "
+                           f"`{pa.get('predicted_text', '-')}` | "
+                           f"`{ca.get('predicted_text', '-')}` | "
+                           f"{pa.get('em', 0):.0f} | {ca.get('em', 0):.0f} |\n")
+
+    return f"""# 检索质量对比 (Retrieval Eval) — B2 + Reader 方案
 
 ## 实验设置
 - 文档库大小: {n_docs}
 - 评估 query 数: 明文 {n_q_plain} 条；密态 {n_q_cipher} 条
 - BERT: bert-tiny (2 层、hidden=128、vocab=30522)
-- 检索路径: 双路初次检索 → 联合 BERT 推理 → **密态 reranker** (pool @ db_embs.T) → 取 top-K
+- 检索路径: 双路初次检索 → 联合 BERT 推理 → 密态 reranker (pool @ db_embs.T) → 取 top-K
+- 生成路径: 密态 reader (pool · seq_out → 密态 argmax → 密态 gather token)
+- 输出方向: rerank/pool/answer 均仅在 client 端 restore；server 不学习任何客户端结果
 - K 值: {ks}
 
 ## 性能
@@ -282,13 +359,14 @@ def build_report(*, n_docs, n_q_plain, n_q_cipher, plain_total_time, cipher_tota
 | 明文 RAG ({n_q_plain} q) | {plain_total_time:.2f} s ({plain_total_time / max(n_q_plain, 1):.2f} s/q) |
 | 密态 RAG ({n_q_cipher} q) | {cipher_total_time:.2f} s ({(cipher_total_time / max(n_q_cipher, 1)) if n_q_cipher else 0:.2f} s/q) |
 
-## 检索质量
+## 检索质量 + Reader 答案质量
 {table_md}
-
+{answers_md}
 ## 结论
 - 加密前后 Recall@5 差距: {('+' if cipher_avg and cipher_avg.get('R@5', 0) >= plain_avg.get('R@5', 0) else '')}{(cipher_avg.get('R@5', 0) - plain_avg.get('R@5', 0)) if cipher_avg else 0:.4f}
+- 加密前后 Reader EM 差距: {(cipher_avg.get('EM', 0) - plain_avg.get('EM', 0)) if cipher_avg else 0:+.4f}
 - 加密延迟代价: ×{(cipher_total_time / max(n_q_cipher, 1)) / max(plain_total_time / max(n_q_plain, 1), 1e-6) if cipher_avg else 0:.1f}
-- 注：明文/密态 retrieved 都是基于 reranker (pool @ db_embs.T) 的 argsort，**对比口径完全一致**。
+- 隐私保证: server 全程不还原任何与 query 相关的明文（rerank/pool/answer 都在 client 端 restore）
 """
 
 

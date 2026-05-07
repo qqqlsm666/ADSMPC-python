@@ -45,6 +45,22 @@ def main():
     from secure_rag.server import run_server
     from secure_rag.client import run_client
 
+    # 在子进程里加载 tokenizer（用于 client 端 decode 答案 token）
+    tokenizer = None
+    tokenizer_name = payload.get('tokenizer_name')
+    if tokenizer_name:
+        try:
+            from transformers import BertTokenizer
+            tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+        except Exception as e:
+            # mirror fallback
+            try:
+                os.environ.setdefault('HF_ENDPOINT', 'https://hf-mirror.com')
+                from transformers import BertTokenizer
+                tokenizer = BertTokenizer.from_pretrained(tokenizer_name)
+            except Exception as e2:
+                print(f"[worker] tokenizer load failed: {e2}", file=sys.stderr)
+
     server_party = NeuralNetworkCS(type='server')
     client_party = NeuralNetworkCS(type='client')
 
@@ -53,7 +69,9 @@ def main():
         p.set_comparison_provider()
         p.set_nonlinear_operation_provider()
 
-    pool_holder = []
+    # 改造：result holder 由 client 端持有（client 才是最终拿到结果的一方）
+    result_holder = []        # client 端会 append 一个 result dict
+    server_done_holder = []   # server 端跑完会 append [{}] 占位（用来判断 server 已完成）
     server_err: list = []
     client_err: list = []
 
@@ -66,7 +84,7 @@ def main():
                 db_tokens_onehot=payload['db_tokens_onehot'],
                 weight_path=payload.get('weight_path'),
                 bert_config=payload.get('bert_config'),
-                return_holder=pool_holder,
+                return_holder=server_done_holder,
             )
         except Exception as e:
             server_err.append(e)
@@ -78,6 +96,8 @@ def main():
                 query_token_ids=payload['query_token_ids'],
                 query_multihot=payload['query_multihot'],
                 bert_config=payload.get('bert_config'),
+                tokenizer=tokenizer,
+                return_holder=result_holder,
             )
         except Exception as e:
             client_err.append(e)
@@ -86,19 +106,18 @@ def main():
     t_c = threading.Thread(target=_client_thread, daemon=True)
     t_s.start(); t_c.start()
 
-    # 关键：不 join 子线程！server/client 的 close() 里 provider_thread.join() 经常 hang。
-    # 改成主线程轮询：拿到 pool 就立即写出 + os._exit 强退，不管子线程死活。
+    # 主线程轮询：等 client 端 result 写入；不 join 子线程
     import time
-    deadline = time.time() + 300  # 单条 query 上限 5 分钟
+    deadline = time.time() + 300
     while time.time() < deadline:
-        if pool_holder:
+        if result_holder:
             break
         if not (t_s.is_alive() or t_c.is_alive()):
             break
         time.sleep(0.5)
 
-    if not pool_holder:
-        msg = "Server pool 没拿到。"
+    if not result_holder:
+        msg = "Client result 没拿到。"
         if server_err:
             msg += f" server 线程异常: {server_err[0]!r}"
         if client_err:
@@ -109,12 +128,12 @@ def main():
             pickle.dump({'ok': False, 'error': msg}, f)
         os._exit(1)
 
-    # pool_holder[0] 是 dict: {'pool': ..., 'rerank_scores': ...}
+    # result_holder[0] 是 client 端写出的 dict: {pool, rerank_scores, answer_token_id, answer_text, ...}
     output = {'ok': True}
-    output.update(pool_holder[0])
+    output.update(result_holder[0])
     with open(output_path, 'wb') as f:
         pickle.dump(output, f)
-    # 不 join 子线程，直接强退；OS 会回收所有资源
+    # 不 join 子线程，直接强退
     os._exit(0)
 
 

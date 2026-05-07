@@ -24,7 +24,10 @@
       "Bash(cmd //c \"D:\\\\\\\\桌面\\\\\\\\加密rag\\\\\\\\ADSMPC-python\\\\\\\\NssMPClib\\\\\\\\csprng\\\\\\\\dump_deps.bat\")",
       "Read(//d/桌面/加密rag/**)",
       "Read(//d/桌面/加密rag//**)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Read(//tmp/**)",
+      "Bash(sed -n '50,75p' /tmp/b2reader_single.log)",
+      "Bash(awk 'NR>=60 && NR<=72' /tmp/b2reader_single.log)"
     ]
   }
 }
