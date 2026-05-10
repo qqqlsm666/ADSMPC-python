@@ -82,9 +82,11 @@ def main():
                 db_embeddings=payload['db_embeddings'],
                 bm25_matrix=payload['bm25_matrix'],
                 db_tokens_onehot=payload['db_tokens_onehot'],
+                bm25_vocab=payload.get('bm25_vocab'),
                 weight_path=payload.get('weight_path'),
                 bert_config=payload.get('bert_config'),
                 return_holder=server_done_holder,
+                bm25_components=payload.get('bm25_components'),
             )
         except Exception as e:
             server_err.append(e)
@@ -95,6 +97,7 @@ def main():
                 client_party,
                 query_token_ids=payload['query_token_ids'],
                 query_multihot=payload['query_multihot'],
+                bm25_vocab=payload.get('bm25_vocab'),
                 bert_config=payload.get('bert_config'),
                 tokenizer=tokenizer,
                 return_holder=result_holder,

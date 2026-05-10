@@ -22,11 +22,21 @@ from NssMPC.application.neural_network.layers.mha import SecBertModel
 from .config import (
     BERT_CONFIG, NUM_DOCS, TOP_K, SEQ, QUERY_LEN, SEM_DOC_LEN, LEX_DOC_LEN,
     VOCAB_SIZE_BM25, TOTAL_SEQ,
+    PRF_ENABLED, PRF_ALPHA, PRF_BETA, PRF_FEEDBACK_SOURCE,
+    SIMHASH_ENABLED, SIMHASH_BITS, SIMHASH_CANDIDATES_M, SIMHASH_SEED,
+    SPAN_READER_ENABLED, default_qa_head_path,
+    LEX_BM25_ONLINE, LEX_BM25_K1, LEX_BM25_B,
 )
 from .retrieval import (
     secure_inner_product_score,
     secure_lexical_score,
     secure_top_k_indicator,
+    secure_prf_expand_query,
+    get_simhash_projection,
+    secure_simhash_coarse_to_fine,
+    load_qa_head,
+    secure_reader_span,
+    secure_bm25_online_score,
 )
 
 
@@ -47,6 +57,7 @@ def run_client(
     client_party,
     query_token_ids: Optional[torch.Tensor] = None,
     query_multihot: Optional[torch.Tensor] = None,
+    bm25_vocab: Optional[list] = None,
     bert_config: Optional[Dict] = None,
     tokenizer=None,
     return_holder: Optional[list] = None,
@@ -93,8 +104,31 @@ def run_client(
         # ---------- 2. 接收文档库 ----------
         print("[Client] 接收密态知识库...")
         my_db_share = client_party.receive()[0]
-        print("[Client] 接收 BM25 密态索引矩阵...")
-        my_bm25_matrix_share = client_party.receive()[0]
+
+        # SimHash 粗筛预处理（与 server 端对称）
+        my_doc_hashes_share = None
+        simhash_proj_ring = None
+        if SIMHASH_ENABLED:
+            print(f"[Client] 构建 SimHash 投影 W (L={SIMHASH_BITS}, seed={SIMHASH_SEED}) ...")
+            simhash_W = get_simhash_projection(cfg['hidden_size'], SIMHASH_BITS, seed=SIMHASH_SEED)
+            simhash_proj_ring = RingTensor.convert_to_ring(simhash_W)
+            print("[Client] 接收 doc SimHash 比特库 ...")
+            my_doc_hashes_share = client_party.receive()[0]
+
+        # 词汇路：根据 LEX_BM25_ONLINE 选择两种 share 接收方式之一
+        my_bm25_matrix_share = None
+        my_tf_share = None
+        my_idf_share = None
+        my_doc_norm_share = None
+        if LEX_BM25_ONLINE:
+            print("[Client] [LEX_BM25_ONLINE] 接收 tf/idf/doc_norm 三个分量 ...")
+            my_tf_share = client_party.receive()[0]
+            my_idf_share = client_party.receive()[0]
+            my_doc_norm_share = client_party.receive()[0]
+        else:
+            print("[Client] 接收 BM25 密态索引矩阵...")
+            my_bm25_matrix_share = client_party.receive()[0]
+
         print("[Client] 接收文档 Token 数据库...")
         my_db_tokens_share = client_party.receive()[0]
 
@@ -111,7 +145,16 @@ def run_client(
 
         # ---------- 4. 双路打分 ----------
         print("[Client] RAG: 参与双路密态打分与召回...")
-        scores_sem_share = secure_inner_product_score(query_emb_share, my_db_share)
+        if SIMHASH_ENABLED:
+            print(f"[Client] [Sem] SimHash 粗筛 (M={SIMHASH_CANDIDATES_M}) → 密态 cosine 精排 ...")
+            top_k_ind_sem_share_pre = secure_simhash_coarse_to_fine(
+                query_emb_share, my_db_share, my_doc_hashes_share,
+                simhash_proj_ring, SIMHASH_CANDIDATES_M, top_k=TOP_K,
+            )
+            scores_sem_share = None
+        else:
+            scores_sem_share = secure_inner_product_score(query_emb_share, my_db_share)
+            top_k_ind_sem_share_pre = None
 
         print("[Client] RAG: 执行词汇路(BM25) 打分与排序...")
         qm = query_multihot.to(DEVICE) if query_multihot is not None else _default_query_multihot(VOCAB_SIZE_BM25)
@@ -119,7 +162,8 @@ def run_client(
         my_query_multihot_share = s_qhot_local[0]
         client_party.send(s_qhot_remote)
 
-        scores_lex_share = secure_lexical_score(my_query_multihot_share, my_bm25_matrix_share)
+        scores_lex_share = secure_lexical_score(my_query_multihot_share, my_bm25_matrix_share) if not LEX_BM25_ONLINE else \
+            secure_bm25_online_score(my_query_multihot_share, my_tf_share, my_idf_share, my_doc_norm_share, k1=LEX_BM25_K1)
 
         # ---------- 5. 第二次 Dummy Model + 密态 Top-K + 取文档 + 拼接 ----------
         print("[Client] 执行 Dummy Model 2 (Seq=56)...")
@@ -129,15 +173,44 @@ def run_client(
         dummy_mask_32 = torch.ones(1, TOTAL_SEQ).to(DEVICE)
         client_party.dummy_model(dummy_ids_32, dummy_pos_32, dummy_typ_32, dummy_mask_32)
 
-        top_k_ind_sem_share = secure_top_k_indicator(scores_sem_share, k=TOP_K)
-        top_k_ind_lex_share = secure_top_k_indicator(scores_lex_share, k=TOP_K)
+        if SIMHASH_ENABLED:
+            top_k_ind_sem_share = top_k_ind_sem_share_pre
+        else:
+            top_k_ind_sem_share = secure_top_k_indicator(scores_sem_share, k=TOP_K)
 
-        print("[融合] 通过密态指示器，提取真实 Token 序列...")
+        print("[融合] sem 路 Top-K + 取文档 ...")
         expanded_ind_sem = top_k_ind_sem_share.unsqueeze(-1).unsqueeze(-1)
         my_doc_sem_share = (expanded_ind_sem * my_db_tokens_share).sum(dim=1)
 
-        expanded_ind_lex = top_k_ind_lex_share.unsqueeze(-1).unsqueeze(-1)
-        my_doc_lex_share = (expanded_ind_lex * my_db_tokens_share).sum(dim=1)
+        print("[融合] lex 路 Top-K（第一轮）+ 取反馈 doc ...")
+        top_k_ind_lex_round1_share = secure_top_k_indicator(scores_lex_share, k=TOP_K)
+        expanded_ind_lex_round1 = top_k_ind_lex_round1_share.unsqueeze(-1).unsqueeze(-1)
+        my_doc_lex_round1_share = (expanded_ind_lex_round1 * my_db_tokens_share).sum(dim=1)
+
+        # 密态 PRF 扩展（与 server.py 完全对称）
+        # 反馈源由 PRF_FEEDBACK_SOURCE 控制（'sem' 跨路 / 'lex' 同路 / 'both' 聚合）
+        if PRF_ENABLED and bm25_vocab is not None:
+            if PRF_FEEDBACK_SOURCE == 'sem':
+                feedback_doc_share = my_doc_sem_share
+            elif PRF_FEEDBACK_SOURCE == 'both':
+                feedback_doc_share = my_doc_sem_share + my_doc_lex_round1_share
+            else:  # 'lex'
+                feedback_doc_share = my_doc_lex_round1_share
+            print(f"[PRF] 反馈源={PRF_FEEDBACK_SOURCE}, 扩展 query (alpha={PRF_ALPHA}, beta={PRF_BETA}) ...")
+            q_expanded_share = secure_prf_expand_query(
+                my_query_multihot_share, feedback_doc_share, bm25_vocab,
+                alpha=PRF_ALPHA, beta=PRF_BETA,
+            )
+            print("[Client] RAG: 词汇路第二轮打分（PRF 扩展 query）...")
+            scores_lex_share_round2 = secure_lexical_score(q_expanded_share, my_bm25_matrix_share) if not LEX_BM25_ONLINE else \
+                secure_bm25_online_score(q_expanded_share, my_tf_share, my_idf_share, my_doc_norm_share, k1=LEX_BM25_K1)
+
+            print("[融合] lex 路 Top-K（第二轮）+ 取最终 doc ...")
+            top_k_ind_lex_share = secure_top_k_indicator(scores_lex_share_round2, k=TOP_K)
+            expanded_ind_lex = top_k_ind_lex_share.unsqueeze(-1).unsqueeze(-1)
+            my_doc_lex_share = (expanded_ind_lex * my_db_tokens_share).sum(dim=1)
+        else:
+            my_doc_lex_share = my_doc_lex_round1_share
 
         my_query_share = s_ids[0][0]
         my_joint_ids_share = ArithmeticSecretSharing.cat(
@@ -177,9 +250,24 @@ def run_client(
 
         # ---------- 8. 密态 Reader（双方对称调用，内部含 top_k_indicator + gather）----------
         print("[Client] 密态 reader 抽取答案 ...")
-        answer_token_oh_share, reader_logits_share, position_indicator_share = secure_reader(
-            pool, seq_out, my_joint_ids_share,
-        )
+        span_token_oh_share = None
+        if SPAN_READER_ENABLED:
+            print("[Client] [Reader] 使用 SQuAD-style span head ...")
+            qa_W_ring, qa_b_ring = load_qa_head(default_qa_head_path())
+            (
+                answer_token_oh_share,
+                reader_logits_share,
+                end_logits_share,
+                position_indicator_share,
+                span_token_oh_share,
+            ) = secure_reader_span(
+                seq_out, my_joint_ids_share,
+                qa_W_ring, qa_b_ring,
+            )
+        else:
+            answer_token_oh_share, reader_logits_share, position_indicator_share = secure_reader(
+                pool, seq_out, my_joint_ids_share,
+            )
 
         # ---------- 9. 接收 server 的三个 share，在 client 端 restore ----------
         # 顺序与 server 端 send 严格对齐：rerank → pool → answer → reader_logits → position_indicator
@@ -195,7 +283,20 @@ def run_client(
         s_answer = client_party.receive()
         final_answer = ArithmeticSecretSharing.restore_from_shares(answer_token_oh_share, s_answer)
         answer_oh = final_answer.convert_to_real_field()                           # [1, V]
-        answer_token_id = int(answer_oh.argmax(dim=-1).item())
+        # SPAN reader 输出的是 span 内 token one-hot 之和（多个非零位置）
+        # 启发式 reader 输出的是单个 token 的 one-hot
+        if SPAN_READER_ENABLED:
+            # nonzero 位置 = span 包含的所有 token id
+            answer_oh_flat = answer_oh.view(-1)                                    # [V]
+            nz_mask = answer_oh_flat > 0.5                                          # 容忍数值噪声
+            span_token_ids = nz_mask.nonzero(as_tuple=True)[0].tolist()            # 多个 token id
+            if not span_token_ids:
+                # 退化保护：取 argmax
+                span_token_ids = [int(answer_oh_flat.argmax().item())]
+            answer_token_id = span_token_ids[0]
+        else:
+            span_token_ids = [int(answer_oh.argmax(dim=-1).item())]
+            answer_token_id = span_token_ids[0]
 
         # 诊断信息（reader logits 与 position indicator）
         s_reader_logits = client_party.receive()
@@ -205,13 +306,35 @@ def run_client(
         s_position = client_party.receive()
         final_position = ArithmeticSecretSharing.restore_from_shares(position_indicator_share, s_position)
         position_real = final_position.convert_to_real_field().view(-1)            # [seq_len]
-        answer_position = int(position_real.argmax().item())
+        if SPAN_READER_ENABLED:
+            # span_mask is the position vector; first nonzero = start_pos
+            nz = (position_real > 0.5).nonzero(as_tuple=True)[0]
+            answer_position = int(nz[0].item()) if nz.numel() > 0 else 0
+        else:
+            answer_position = int(position_real.argmax().item())
+
+        # SPAN_READER_ENABLED 多收一个 share：[1, L, V] span 内每个位置的 token one-hot
+        ordered_span_token_ids = None
+        if SPAN_READER_ENABLED:
+            s_span_oh = client_party.receive()
+            final_span_oh = ArithmeticSecretSharing.restore_from_shares(span_token_oh_share, s_span_oh)
+            span_oh_real = final_span_oh.convert_to_real_field().view(span_token_oh_share.shape[1], -1)  # [L, V]
+            # 在 span 位置（position_real > 0.5）做明文 argmax 取 token id
+            nz_pos = (position_real > 0.5).nonzero(as_tuple=True)[0]
+            ordered_span_token_ids = []
+            for pos_i in nz_pos.tolist():
+                tok_id = int(span_oh_real[pos_i].argmax().item())
+                ordered_span_token_ids.append(tok_id)
+            if not ordered_span_token_ids:
+                ordered_span_token_ids = span_token_ids
+            span_token_ids = ordered_span_token_ids
+            answer_token_id = span_token_ids[0] if span_token_ids else 0
 
         # ---------- 10. 用 tokenizer decode 答案 token ----------
         answer_text = None
         if tokenizer is not None:
             try:
-                answer_text = tokenizer.decode([answer_token_id]).strip()
+                answer_text = tokenizer.decode(span_token_ids).strip()
             except Exception as e:
                 answer_text = f"<decode_error: {e}>"
 
@@ -239,6 +362,7 @@ def run_client(
                 'answer_text':       answer_text,
                 'answer_position':   answer_position,
                 'reader_logits':     reader_logits_real.detach().cpu(),
+                'span_token_ids':    span_token_ids,
             })
 
     client_party.close()

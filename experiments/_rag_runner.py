@@ -41,6 +41,8 @@ def run_secure_rag_once(
     timeout_sec: int = 600,
     show_subprocess_output: bool = True,
     tokenizer_name: Optional[str] = None,
+    bm25_vocab: Optional[list] = None,
+    bm25_components: Optional[Dict] = None,
 ) -> Dict[str, torch.Tensor]:
     """起子进程跑一次完整加密 RAG。
 
@@ -71,6 +73,8 @@ def run_secure_rag_once(
         'weight_path':       weight_path,
         'bert_config':       bert_config,
         'tokenizer_name':    tokenizer_name,
+        'bm25_vocab':        bm25_vocab,
+        'bm25_components':   bm25_components,
     }
     if device is not None:
         payload['device'] = device

@@ -34,7 +34,13 @@ from NssMPC.application.neural_network.layers.mha import SecBertModel
 from .config import (
     BERT_CONFIG, SEQ, NUM_DOCS, TOP_K, QUERY_LEN, SEM_DOC_LEN, LEX_DOC_LEN,
     TOTAL_SEQ, VOCAB_SIZE_BM25,
+    PRF_ENABLED, PRF_ALPHA, PRF_BETA, PRF_FEEDBACK_SOURCE,
+    SIMHASH_ENABLED, SIMHASH_BITS, SIMHASH_CANDIDATES_M, SIMHASH_SEED,
+    SPAN_READER_ENABLED, default_qa_head_path,
+    LEX_BM25_ONLINE, LEX_BM25_K1, LEX_BM25_B,
 )
+from .retrieval import get_simhash_projection, plaintext_simhash_bits
+from .retrieval import get_simhash_projection, plaintext_simhash_bits
 
 
 def _load_weights_into(model: SecBertModel, weight_path: str, log_prefix: str = "[Plain]") -> int:
@@ -142,6 +148,51 @@ def build_bm25_matrix(
     return bm25                                                                   # [V, N_DOCS]
 
 
+def build_bm25_components(
+    docs_token_ids: torch.Tensor,
+    bm25_vocab: List[int],
+    k1: float = 1.5,
+    b: float = 0.75,
+):
+    """
+    把 BM25 拆解成三个分量：tf_matrix [V, N], idf [V], doc_norm [N]。
+
+    BM25 公式: score = sum_v indicator[v] * idf[v] * tf[v,d] * (k1+1) / (tf[v,d] + doc_norm[d])
+        其中 doc_norm[d] = k1 * (1 - b + b * doc_len[d] / avgdl)
+
+    用于 LEX_BM25_ONLINE=True 模式：协议层 server 暴露原始 tf/idf/doc_norm 而非预算 BM25 矩阵，
+    BM25 公式在线密态计算（含密态 div），与 Pisces ∏PrivateBM25 Protocol 2 Step 4 对齐。
+
+    Args:
+        docs_token_ids: [N, doc_len] long
+        bm25_vocab:     [V] list of token ids
+        k1, b:          BM25 公开参数
+
+    Returns:
+        (tf [V, N] float, idf [V] float, doc_norm [N] float)
+    """
+    import math
+    n_docs, _ = docs_token_ids.shape
+    V = len(bm25_vocab)
+
+    doc_lens = (docs_token_ids != 0).sum(dim=1).float().clamp(min=1)         # [N]
+    avgdl = doc_lens.mean().item()
+    doc_norm = k1 * (1 - b + b * doc_lens / avgdl)                            # [N]
+
+    tf = torch.zeros(V, n_docs)
+    idf = torch.zeros(V)
+    for v_idx, term_id in enumerate(bm25_vocab):
+        df = ((docs_token_ids == term_id).any(dim=1)).sum().item()
+        if df == 0:
+            continue
+        idf[v_idx] = math.log((n_docs - df + 0.5) / (df + 0.5) + 1)
+        for d_idx in range(n_docs):
+            cnt = (docs_token_ids[d_idx] == term_id).sum().item()
+            if cnt > 0:
+                tf[v_idx, d_idx] = float(cnt)
+    return tf, idf, doc_norm
+
+
 @torch.no_grad()
 def plaintext_rag(
     query_token_ids: torch.Tensor,
@@ -150,6 +201,7 @@ def plaintext_rag(
     db_tokens_onehot: torch.Tensor,
     query_multihot: torch.Tensor,
     bert_model: SecBertModel,
+    bm25_vocab: Optional[List[int]] = None,
     bert_config: Optional[Dict] = None,
     device: str = 'cpu',
     top_k: int = TOP_K,                    # 兼容旧参数；目前不影响联合推理
@@ -194,16 +246,58 @@ def plaintext_rag(
     _, query_emb = bert_model(oh_ids, oh_pos, oh_typ, mask)                       # [1, hidden]
 
     # ---------- 2. 语义路打分 ----------
-    sem_scores = (query_emb * db_embeddings).sum(dim=-1)                          # [NUM_DOCS]
+    if SIMHASH_ENABLED:
+        # Pisces-aligned coarse-to-fine：明文 SimHash 粗筛 → 候选集 cosine 精排
+        simhash_W = get_simhash_projection(cfg['hidden_size'], SIMHASH_BITS, seed=SIMHASH_SEED, device=device)
+        q_hash = plaintext_simhash_bits(query_emb, simhash_W).view(-1)                  # [L]
+        doc_hashes = plaintext_simhash_bits(db_embeddings, simhash_W)                   # [N, L]
+        # Hamming 距离 |q-d| with q,d∈{0,1} → q+d-2qd
+        hamming = (q_hash.unsqueeze(0) + doc_hashes - 2 * q_hash.unsqueeze(0) * doc_hashes).sum(dim=-1)  # [N]
+        M = min(SIMHASH_CANDIDATES_M, db_embeddings.shape[0])
+        cand_idx = torch.topk(-hamming, k=M).indices                                     # [M] doc id of M 候选
+        # 在候选集上做 cosine 精排
+        cand_embs = db_embeddings[cand_idx]                                              # [M, hidden]
+        cand_scores = (query_emb * cand_embs).sum(dim=-1)                                # [M]
+        # 把全 N 维 sem_scores 填回（候选外位置 = -inf 等价）
+        sem_scores = torch.full((db_embeddings.shape[0],), float('-inf'), device=device)
+        sem_scores[cand_idx] = cand_scores
+    else:
+        sem_scores = (query_emb * db_embeddings).sum(dim=-1)                              # [NUM_DOCS]
 
-    # ---------- 3. 词汇路打分 ----------
-    lex_scores = (query_multihot * bm25_matrix).sum(dim=0)                        # [NUM_DOCS]
+    # ---------- 3. 词汇路打分（第一轮）----------
+    lex_scores_round1 = (query_multihot * bm25_matrix).sum(dim=0)                 # [NUM_DOCS]
 
     # ---------- 4. 取 top-k（评估用）+ 取 top-1（联合推理用）----------
     n_docs = db_tokens_onehot.shape[0]
     k_for_metrics = min(top_k, n_docs)
     sem_top_k_idx = torch.topk(sem_scores, k=k_for_metrics).indices               # [k]
-    lex_top_k_idx = torch.topk(lex_scores, k=k_for_metrics).indices               # [k]
+
+    # 词汇路第一轮 Top-K（用于反馈源 + IR 评估对比基线）
+    lex_top_k_idx_round1 = torch.topk(lex_scores_round1, k=k_for_metrics).indices
+
+    # ---------- 3.5. PRF 扩展 query（与 secure_rag.retrieval.secure_prf_expand_query 对齐）----------
+    if PRF_ENABLED and bm25_vocab is not None:
+        # 反馈源：PRF_FEEDBACK_SOURCE 控制
+        if PRF_FEEDBACK_SOURCE == 'sem':
+            feedback_doc_oh = db_tokens_onehot[sem_top_k_idx[0]]                  # [doc_len, V_bert]
+            doc_term_freq = feedback_doc_oh.sum(dim=0)                            # [V_bert]
+        elif PRF_FEEDBACK_SOURCE == 'both':
+            doc_term_freq = (
+                db_tokens_onehot[sem_top_k_idx[0]].sum(dim=0) +
+                db_tokens_onehot[lex_top_k_idx_round1[0]].sum(dim=0)
+            )
+        else:  # 'lex'
+            feedback_doc_oh = db_tokens_onehot[lex_top_k_idx_round1[0]]
+            doc_term_freq = feedback_doc_oh.sum(dim=0)
+        bm25_indices = torch.tensor(bm25_vocab, dtype=torch.long, device=device)
+        doc_bm25_feedback = doc_term_freq[bm25_indices].unsqueeze(-1)             # [V_bm25, 1]
+        q_expanded = PRF_ALPHA * query_multihot + PRF_BETA * doc_bm25_feedback
+        # 第二轮 lex 检索
+        lex_scores = (q_expanded * bm25_matrix).sum(dim=0)                        # [NUM_DOCS]
+        lex_top_k_idx = torch.topk(lex_scores, k=k_for_metrics).indices
+    else:
+        lex_scores = lex_scores_round1
+        lex_top_k_idx = lex_top_k_idx_round1
 
     # 联合推理只用 top-1（输入序列长度固定 56，只塞得下 1 个 sem + 1 个 lex）
     sem_top1_idx = sem_top_k_idx[:1]                                              # [1]
@@ -239,23 +333,69 @@ def plaintext_rag(
     rerank_top_k = min(top_k, n_docs)
     rerank_top_k_idx = torch.topk(rerank_scores, k=rerank_top_k).indices            # [k]
 
-    # ---------- 8. Reader（与 secure_rag.retrieval.secure_reader 对齐）----------
-    # 启发式 head: reader_logits[i] = pool · seq_out[i]
-    reader_logits = (seq_out * pool.unsqueeze(1)).sum(dim=-1).view(-1)             # [L]
-    # Mask：query 段（位置 0..QUERY_LEN-1）+ special token (PAD=0, CLS=101, SEP=102)
-    # 让 reader 只在 doc 段的实词中产生答案
+    # ---------- 8. Reader（与 secure_rag.retrieval.secure_reader / secure_reader_span 对齐）----------
     mask_value = 1000.0
-    if QUERY_LEN > 0:
-        reader_logits[:QUERY_LEN] = reader_logits[:QUERY_LEN] - mask_value
     joint_token_ids = joint_ids_oh[0].argmax(dim=-1)                               # [L]
-    for special_id in (0, 101, 102):
-        reader_logits = reader_logits - (joint_token_ids == special_id).float() * mask_value
-    answer_position = int(reader_logits.argmax().item())
-    # 从 joint_ids_oh 的 seq 维度上取出答案 token
-    answer_token_oh = joint_ids_oh[0, answer_position]                              # [V]
-    answer_token_id = int(answer_token_oh.argmax().item())
-    # decode：默认不做（实验脚本里有 tokenizer 时会做）
     answer_text = None
+
+    if SPAN_READER_ENABLED:
+        # SQuAD-style span reader：用 mrm8488/bert-tiny-finetuned-squadv2 的 qa_outputs
+        import os as _os
+        _qa_path = default_qa_head_path()
+        if not _os.path.exists(_qa_path):
+            raise FileNotFoundError(
+                f"QA head not found: {_qa_path}\n"
+                f"先跑: python scripts/extract_squad_qa_head.py"
+            )
+        _qa_state = torch.load(_qa_path, map_location=device)
+        qa_W = _qa_state['qa_W'].to(device).to(torch.float32)            # [2, hidden]
+        qa_b = _qa_state['qa_b'].to(device).to(torch.float32)            # [2]
+        # logits = seq_out @ qa_W.T + qa_b → [1, L, 2]
+        qa_logits = seq_out @ qa_W.T + qa_b                              # [1, L, 2]
+        start_logits = qa_logits[..., 0].view(-1)                        # [L]
+        end_logits = qa_logits[..., 1].view(-1)                          # [L]
+        # mask
+        if QUERY_LEN > 0:
+            start_logits[:QUERY_LEN] = start_logits[:QUERY_LEN] - mask_value
+            end_logits[:QUERY_LEN] = end_logits[:QUERY_LEN] - mask_value
+        for special_id in (0, 101, 102):
+            sp_mask = (joint_token_ids == special_id).float() * mask_value
+            start_logits = start_logits - sp_mask
+            end_logits = end_logits - sp_mask
+        start_pos = int(start_logits.argmax().item())
+        end_pos = int(end_logits.argmax().item())
+        # 强制 end >= start，超长截断
+        if end_pos < start_pos:
+            end_pos = start_pos
+        if end_pos - start_pos > 8:                                       # 限制 span 长度 ≤ 8
+            end_pos = start_pos + 8
+        # gather span tokens
+        span_token_ids = joint_token_ids[start_pos:end_pos + 1].tolist()
+        answer_position = start_pos                                       # diagnostic：start position
+        answer_token_id = span_token_ids[0] if span_token_ids else 0
+        # answer_text 在 run_numerical_compare/eval 里用 tokenizer 拼起来
+        reader_logits = start_logits                                      # diagnostic
+        # 把整个 span 也保存出来（list of token ids）
+        reader_extras = {
+            'start_pos':       start_pos,
+            'end_pos':         end_pos,
+            'span_token_ids':  span_token_ids,
+        }
+    else:
+        # 旧的启发式 head: reader_logits[i] = pool · seq_out[i]
+        reader_logits = (seq_out * pool.unsqueeze(1)).sum(dim=-1).view(-1)             # [L]
+        if QUERY_LEN > 0:
+            reader_logits[:QUERY_LEN] = reader_logits[:QUERY_LEN] - mask_value
+        for special_id in (0, 101, 102):
+            reader_logits = reader_logits - (joint_token_ids == special_id).float() * mask_value
+        answer_position = int(reader_logits.argmax().item())
+        answer_token_oh = joint_ids_oh[0, answer_position]                              # [V]
+        answer_token_id = int(answer_token_oh.argmax().item())
+        reader_extras = {
+            'start_pos':       answer_position,
+            'end_pos':         answer_position,
+            'span_token_ids':  [answer_token_id],
+        }
 
     return {
         'pool':              pool.detach().cpu(),
@@ -270,4 +410,7 @@ def plaintext_rag(
         'answer_position':   answer_position,
         'answer_token_id':   answer_token_id,
         'answer_text':       answer_text,
+        'span_token_ids':    reader_extras['span_token_ids'],
+        'start_pos':         reader_extras['start_pos'],
+        'end_pos':           reader_extras['end_pos'],
     }

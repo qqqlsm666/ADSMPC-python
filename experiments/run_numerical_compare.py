@@ -24,9 +24,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from secure_rag.config import (
     BERT_CONFIG, SEM_DOC_LEN, QUERY_LEN, VOCAB_SIZE_BM25, default_weight_path,
+    LEX_BM25_ONLINE, LEX_BM25_K1, LEX_BM25_B,
 )
 from secure_rag.plaintext import (
     build_plaintext_bert, encode_docs_to_embeddings, build_bm25_matrix, plaintext_rag,
+    build_bm25_components,
 )
 from secure_rag.params import gen_params
 
@@ -112,6 +114,7 @@ def main():
         db_tokens_onehot=docs_onehot,
         query_multihot=query_multihots[q_idx],
         bert_model=plain_bert,
+        bm25_vocab=bm25_vocab,
         device='cpu',
     )
     plain_time = time.time() - t0
@@ -128,6 +131,7 @@ def main():
         db_tokens_onehot=docs_onehot,
         weight_path=weight_path,
         tokenizer_name='bert-base-uncased',
+        bm25_vocab=bm25_vocab,
     )
     cipher_pool = cipher_out['pool']                                       # [1, hidden]
     cipher_rerank = cipher_out['rerank_scores']                            # [NUM_DOCS]

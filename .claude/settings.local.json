@@ -27,7 +27,23 @@
       "Bash(python *)",
       "Read(//tmp/**)",
       "Bash(sed -n '50,75p' /tmp/b2reader_single.log)",
-      "Bash(awk 'NR>=60 && NR<=72' /tmp/b2reader_single.log)"
+      "Bash(awk 'NR>=60 && NR<=72' /tmp/b2reader_single.log)",
+      "Bash(pip list *)",
+      "Bash(pdftotext -layout doc/5016_react_synergizing_reasoning_an.pdf /tmp/react_paper.txt)",
+      "PowerShell(python -c \"import pypdf; print\\('pypdf', pypdf.__version__\\)\" 2>&1; python -c \"import PyPDF2; print\\('PyPDF2', PyPDF2.__version__\\)\" 2>&1; python -c \"import pdfplumber; print\\('pdfplumber', pdfplumber.__version__\\)\" 2>&1; python -c \"import fitz; print\\('pymupdf', fitz.__version__\\)\" 2>&1)",
+      "PowerShell(python -c \"from pypdf import PdfReader; r = PdfReader\\(r'D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\doc\\\\5016_react_synergizing_reasoning_an.pdf'\\); print\\('pages:', len\\(r.pages\\)\\); [print\\(f'--- page {i+1} ---'\\); print\\(r.pages[i].extract_text\\(\\)\\) for i in range\\(min\\(6, len\\(r.pages\\)\\)\\)]\" 2>&1 | Select-Object -First 400)",
+      "PowerShell(python \"D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\test\\\\extract_react.py\" > \"D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\test\\\\react_text.txt\" 2>&1; \\(Get-Item \"D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\test\\\\react_text.txt\"\\).Length)",
+      "PowerShell(python \"D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\test\\\\extract_react.py\")",
+      "PowerShell(python \"D:\\\\桌面\\\\加密rag\\\\ADSMPC-python\\\\test\\\\extract_pisces.py\")",
+      "Bash(conda env *)",
+      "Bash(/d/anaconda/envs/ADSMPC-python/python.exe *)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 0 --output experiments/results/numerical_compare_simhash.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 0 --skip_gen_params --output experiments/results/numerical_compare_simhash_l128.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4.md)",
+      "Bash(rm -rf secure_rag/__pycache__ experiments/__pycache__)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4_v2.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4_v3.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4_v4.md)"
     ]
   }
 }

@@ -1,0 +1,1160 @@
+pages: 20
+
+===== PAGE 1 =====
+Published as a conference paper at ICLR 2026
+Pisces: Cryptography-based Private Retrieval-Augmented
+Generation with Dual-Path Retrieval
+Xiaojian Liang ∗, Lushan Song∗, Shishuai Du∗, Weicheng Zhu, Tan Li Hui Faith, Jun Jie Sim,
+Haibing Jin, Zhenghao Wu, Yingting Liu, Xin Zhang, Jiang-Ming Yang, Pu Duan†
+Ant International, Ant Group
+ABSTRACT
+Retrieval-augmented generation (RAG) enhances the response quality of large lan-
+guage models (LLMs) when handling domain-specific tasks, yet raises significant
+privacy concerns. This is because both the user query and documents within the
+knowledge base often contain sensitive or confidential information. To address
+these concerns, we proposePisces, the first practical cryptography-based RAG
+framework that supports dual-path retrieval, while protecting both the query and
+documents. Along the semantic retrieval path, we reduce computation and com-
+munication overhead by leveraging a coarse-to-fine strategy. Specifically, a novel
+oblivious filter is used to privately select a candidate set of documents to reduce the
+scale of subsequent cosine similarity computations. For the lexical retrieval path,
+to reduce the overhead of repeatedly invoking labeled PSI, we implement a multi-
+instance labeled PSI protocol to compute term frequencies for BM25 scoring in a
+single execution.Piscescan also be integrated with existing privacy-preserving
+LLM inference frameworks to achieve end-to-end privacy. Experiments demon-
+strate thatPiscesachieves retrieval accuracy comparable to the plaintext base-
+lines, within a 1.87% margin. Our code is available on GitHub1.
+1 INTRODUCTION
+Although large language models (LLMs) (Achiam et al., 2023; Liu et al., 2024) have achieved re-
+markable success in natural language processing tasks, they still exhibit significant limitations in
+domain-specific tasks, for example, healthcare diagnostics. In particular, LLMs may produce hal-
+lucinations due to a lack of domain-specific knowledge (Huang et al., 2025; Li et al., 2024a). To
+mitigate these limitations, retrieval-augmented generation (RAG) (Lewis et al., 2020; Gao et al.,
+2023; Jiang et al., 2023) has emerged as a promising paradigm. RAG mainly consists of two pro-
+cesses: retrieval and generation. Specifically, it first retrieves relevant documents from external
+knowledge bases and then generates a higher-quality response by integrating the query with the
+retrieved documents.
+However, RAG systems, which involve private data, raise significant privacy concerns (Huang et al.,
+2023; Zeng et al., 2024). For instance, in personalized healthcare diagnostics, a healthcare agent with
+an LLM as the cornerstone for which personalized queries regarding one’s health are made against,
+supported by an RAG system that encompasses a medical knowledge base. The user interacting with
+the agent would be highly concerned about revealing too much personal information, such as family
+history, for fear of any potential privacy exposure. Simultaneously, queries could reveal information
+about the individuals part of the RAG knowledge base, which contains highly sensitive personal
+information that is hard to anonymize in nature, such as rare diseases, clinical notes, or biometric
+identifiers. These works (Zeng et al., 2024; Huang et al., 2023) demonstrate that it is possible to
+extract sentences verbatim or personally identifiable information from the knowledge base. The
+leakage of any sensitive information would violate data privacy regulations, such as GDPR (V oigt
+& V on dem Bussche, 2017), PIPL (Congress, a), and HIPAA (Congress, b). This highlights the
+need for privacy in a reciprocal manner, where, during retrieval, the knowledge base does not learn
+additional information about the user, and the user does not learn additional information about the
+knowledge base.
+∗Equal contribution.
+†Correspondence to p.duan@ant-intl.com
+1https://github.com/liang-xiaojian/Pisces
+1
+
+===== PAGE 2 =====
+Published as a conference paper at ICLR 2026
+Table 1: Comparison with prior works.
+Framework Retrieval Path Privacy MechanismSemantic Lexical Query Documents
+DP-RAG (Grislain, 2025) DP
+RemoteRAG (Cheng et al., 2024) DP, Cryptography
+(Yao & Li, 2025) DP
+Pisces(Ours) Cryptography
+While recent substantial works (Rovida & Leporati, 2024; Moon et al., 2024; Xu et al., 2025; Lu
+et al., 2023) have focused on private generation in RAG systems, the private retrieval process remains
+comparatively underexplored. Besides, as summarized in Table 1, existing works on the private
+retrieval process (Grislain, 2025; Cheng et al., 2025; Yao & Li, 2025) primarily apply differential
+privacy (DP). However, these works typically exhibit limited retrieval performance due to support
+for only semantic retrieval and struggle with lexical retrieval (e.g., BM25). This is because the noise
+introduced by DP inherently disrupts exact term matching. Works like (Kuzi et al., 2020) suggest
+that dual-path retrieval, a combination of semantic and lexical retrieval, achieves better retrieval
+performance.
+Consequently, we aim to tackle a challenging question:How can we support dual-path retrieval
+while ensuring privacy for both the query and documents during the retrieval process?
+We consider a cryptography-based solution to address the question above. Firstly, cryptography-
+based technologies, such as secure multi-party computation (MPC), support both the similarity
+computations required by semantic retrieval and the exact term matching essential for lexical re-
+trieval, addressing the key limitations of DP-based approaches. This is because cryptography-based
+technologies do not alter the raw data, while DP involves perturbing the data with irreversible noise,
+which makes it difficult to perform exact matching. Secondly, during the entire retrieval process,
+cryptography-based techniques ensure that any raw data exchanged is in an encrypted form, protect-
+ing the privacy of both the query and documents.
+Unfortunately, existing cryptography-based technologies suffer from two challenges in terms of
+efficiency when directly deployed to the dual-path retrieval. (1) For the semantic retrieval, direct
+computation of similarities between a query and all documents in a large-scale knowledge base
+incurs prohibitive computation and communication overhead. (2) For the lexical retrieval, state-
+of-the-art labeled private set intersection (PSI) methods require multiple invocations to obtain all
+necessary term frequencies for BM25 scoring, leading to significant computational overhead.
+To address these two challenges, we propose a cryptography-based framework, Pisces, that intro-
+duces two customized cryptography-based protocols for significant efficiency improvements. (1) For
+the semantic retrieval, we introduce a novel oblivious filter protocol as the first step of our adopted
+coarse-to-fine strategy. This protocol privately selects a candidate set to substantially reduce the
+search space. Then, we conduct private cosine similarity computations between the query and can-
+didates, utilizing MPC primitives. (2) For the lexical retrieval path, we design a multi-instance
+labeled PSI protocol that obtains all necessary term frequencies in a single execution, avoiding the
+overhead of repeated labeled PSI invocations.Piscesprovides strong privacy guarantees for both
+the query and documents while maintaining high retrieval performance, offering a practical solution
+for privacy-sensitive RAG applications.
+Our contributions are summarized as follows:
+• To the best of our knowledge, we are the first to propose the cryptography-based RAG retrieval
+framework,Pisces, with dual-path retrieval, while ensuring privacy for both the query and
+documents.
+• We propose two customized cryptography-based protocols for significant efficiency improve-
+ments. (1) We adopt a coarse-to-fine strategy for the semantic retrieval path with a novel oblivi-
+ous filter to reduce computation and communication overhead. (2) We design an efficient multi-
+instance labeled PSI protocol to avoid the cost of repeated labeled PSI invocations.
+2
+
+===== PAGE 3 =====
+Published as a conference paper at ICLR 2026
+We conducted comprehensive experiments to evaluate the performance ofPisces. For accuracy,
+the results show thatPiscesachieves retrieval accuracy comparable to plaintext baselines over
+the ground-truth of the dataset, within a 1.87% margin. At the same time, we observe that combin-
+ing semantic and lexical paths significantly improves retrieval accuracy. For efficiency, the experi-
+ments demonstrate that our coarse-to-fine strategy saves retrieval time by 41.21%, reduces upload
+and download overhead by 68.77% compared to the fine-only strategy on the large-scale dataset.
+Additionally, our proposed multi-instance labeled PSI outperforms state-of-the-art labeled PSI pro-
+tocol (Yang et al., 2024), achieving 496.03×speedup in runtime, and reducing upload and download
+overhead by 70733×and 2.84×, respectively. Overall,Piscesis practical in both accuracy and
+efficiency.
+It’s worth noting that whilePiscesfocuses on privacy preservation during the retrieval process,
+it can seamlessly integrate with existing privacy-preserving LLM inference frameworks to achieve
+end-to-end private preservation in the whole RAG system.
+2 PRELIMINARIES
+In this work, we use a variety of cryptographic primitives to achieve a private RAG retrieval process.
+Below we briefly summarize each primitive, and further details can be found in Appendix A.1.
+•Secure Multi-Party Computation(Ma et al., 2023). A cryptographic technology that enables
+multiple mutually distrustful parties to cooperatively compute a predefined function while keeping
+their data private.
+•Secret Sharing(Keller, 2020). A critical primitive of MPC, that breaks a secret value into multiple
+shares held by different parties. The secret value can only be reconstructed when a sufficient
+number of shares are combined.
+•Labeled Private Set Intersection(Chen et al., 2018). PSI (Jarecki & Liu, 2010) allows two
+parties to learn the intersection of their sets without revealing any information outside the inter-
+section. Labeled PSI extends the traditional PSI by returning the label that is associated with each
+element in the intersection.
+•Oblivious Pseudorandom Function (OPRF)(Naor et al., 1999). Enables two parties to jointly
+compute a pseudorandom function such that one party learns the output, while the other learns
+nothing about the input or output.
+•Oblivious Key-Value Store (OKVS)(Garimella et al., 2021). A data structure that encodes a set
+of key-value pairs into a compact representation while preserving the privacy of both keys and
+values.
+•Batch private information retrieval-to-Share (PIR-to-share)(Song et al., 2025). A crypto-
+graphic primitive that enables a client to privately retrieve the values corresponding to its queries
+from the server. After the execution, both parties obtain the secret shares of the retrieved values.
+Additionally, we provide detailed descriptions of the semantic similarity (Awasthy et al., 2025;
+Zhang et al., 2025) and BM25 (Robertson et al., 2009; L`u, 2024) for lexical retrieval in Appendix A.2
+and Appendix A.3, respectively.
+3 PROBLEMDEFINITION ANDTHREATMODEL
+We formally define the problem of private retrieval in RAG systems, followed by the threat model
+considered in this paper. Additionally, the Table 6 in Appendix B summarizes the frequently used
+notation in this paper.
+3.1 PROBLEMDEFINITION
+We consider a setting with two parties: a serverSand a userC. The serverSholds a knowledge base
+that contains a large corpus of sensitive textual documentsD. The userCsubmits a private queryQ
+toS. LetRdenote the retrieval module andD K denote the set of top-Kdocuments retrieved from
+D. Then the retrieval process in our paper is defined as:Enc(D K) =R(Q,D). During the retrieval
+process,Piscesensures that neither party learns the other’s sensitive information.
+3
+
+===== PAGE 4 =====
+Published as a conference paper at ICLR 2026
+3.2 THREATMODEL
+We consider a semi-honest adversary, where the two partiesSandCfollow the protocol honestly,
+but are curious about information the other party is holding. Our threat model focuses on the private
+information leakage during the retrieval process in the RAG system. We protect the privacy of both
+the user query and the knowledge base of the server.
+Protection of the user query.During the retrieval process, the server cannot directly access the user
+query. Moreover, the server remains unaware of which specific documents are retrieved, thereby
+preventing any inference of sensitive user information based on retrieval results.
+Protection of the knowledge base.During the retrieval process, the user cannot obtain sensitive
+information within the documents in the knowledge base, nor know which documents were retrieved.
+4 PROPOSED METHOD
+4.1 OVERVIEW
+Piscesinvolves two parties: a serverS, who holds a sensitive knowledge base (a large corpus of
+textual documentsD), and a userC, who holds a private queryQ.
+……
+EmbeddingModel
+Tokenizer
+Private Coarse Matching
+Private BM25 Score Computation
+Query
+LLM
+Private Cosine Similarity Computation
+Encrypted Top-K Chunk RetrievalChunks
+User 𝒞
+Embedding Model
+Tokenizer
+Server 𝒮
+ Retrieved Chunks
+Secure Inference
+Response
+Private Retrieval PhasePreprocessing Phase Private Generation Phase
+Encrypted Information
+Encrypted Top-K Chunk Retrieval
+Local DataProcessingPrivate Semantic RetrievalPrivate Lexical Retrieval
+Figure 1: Overview of our proposedPisces, where the private retrieval phase is our core contri-
+bution.
+As shown in Figure 1, the whole process ofPiscesconsists of three phases:
+Phase 1: Preprocessing Phase.In this phase,Spreprocesses its private document corpusDfor
+efficient retrieval.
+•Document Chunking.Sbreak downDintoNsmaller chunks of text, i.e.D={c 1,c 2, . . . ,cN}.
+•Vector Embedding.Sencodes each chunkc i (i∈[1,N])into vector representations using an
+embedding model, resulting inD v = {Ii;v i;c i}i∈[1,N], whereI i andv i are the index and vector
+representation corresponding to the chunkc i, respectively.
+•Tokenization & Term Frequencies.Stokenizes each chunkc i (i∈[1,N])with a tokenizer and
+computes the term frequencies, resulting inD t =
+
+Ii;{w i,l :t f i,l}l∈[1,mi];c i
+	
+i∈[1,N], wherem i is the
+total number of unique tokens ofc i,w i,l is thel-th token in the chunkc i andt f i,l is its term
+frequency.
+Phase 2: Private Retrieval Phase.In this phase,Sinteracts withCto retrieve the relevant chunks
+for the queryQwith privacy preservation.
+•Local Data Processing.Clocally encodes its queryQinto vector representationsqand tokenizes
+Qtontokens, i.e.Q t ={q 1,q 2, . . . ,qn}, utilizing the same embedding model and tokenizer applied
+during the preprocessing phase.
+4
+
+===== PAGE 5 =====
+Published as a conference paper at ICLR 2026
+•Private Semantic Retrieval.SandCinvoke the private semantic similarity protocol ∏PrivateSS
+(Protocol 1), whereSinputsD v andCinputsq. After execution,Sobtains the encrypted top-K
+chunks with the highest similarity scores.
+•Private Lexical Retrieval.SandCinvoke the private BM25 protocol ∏PrivateBM25 (Protocol 2),
+whereSinputsD t andCinputsQ t. After execution,Sobtains the encrypted top-Kchunks with
+the highest BM25 scores.
+Phase 3: Private Generation Phase.In this phase,Cobtains the response to its queryQwhile
+preserving privacy.
+•Context Fusion.ThenSfuses the encrypted retrieved 2Kchunks with the encrypted query.
+•Secure Inference.SandCexecute the secure LLM inference framework to generate an encrypted
+response toC.
+Notably, in this paper, we pay attention to the preprocessing phase and the private retrieval phase,
+where the private retrieval phase is our core contribution. Furthermore,Piscescan be integrated
+with the existing secure inference framework based on various technologies, such as HE (Rovida &
+Leporati, 2024; Moon et al., 2024), MPC (Xu et al., 2025; Lu et al., 2023; Pang et al., 2024), and
+DP (Koga et al., 2024), to achieve end-to-end privacy.
+4.2 PRIVATESEMANTICRETRIEVAL
+Semantic retrieval aims to retrieve the top-Kmost semantically relevant chunks for a query issued
+by a userCfrom a set of chunks held by a serverS. We design an efficient and private semantic
+similarity protocol ∏PrivateSS (Protocol 1) that leverages a coarse-to-fine pipeline. Direct computa-
+tion of the cosine similarity over the entire set of chunks with cryptographic protocols (e.g., MPC)
+is prohibitively expensive. To mitigate this, we first propose a novel oblivious filter (Protocol 3,
+described in Appendix C) that privately selects a subset of candidate chunks, significantly reducing
+the scale of subsequent cosine similarity computations.
+Protocol 1: ∏PrivateSS
+Input:Sinputs the embedded chunk setD v = {Ii;v i;c i}i∈[1,N], whereI i andv i are the
+index and vector representation corresponding to the chunkc i, respectively.Cinputs
+embedded queryq.
+Output:Slearns the encrypted top-Kchunks {Enc(ct1 ),Enc(c t2 ), . . . ,Enc(ctK )} with the
+highest cosine similarities.
+1:Scomputesv b
+i ←SimHash(v i) ={0,1} L fori∈[1,N].Ccomputesq b ←
+SimHash(q) ={0,1} L.
+2:SandCinvoke the obvious filter ∏Oblivious Filter (Protocol 3) with
+
+Ii;v b
+i ;c i
+	
+i∈[1,N] and
+qb as input, respectively. After execution,Slearns the candidate chunk setD ′.
+3:SandCsecurely compute the cosine similarity between each chunk inD ′ and the query
+using MPC protocols based on secret sharing (Ma et al., 2023), obtaining secret shares
+of the cosine similarities, respectively.
+4:SandCinvoke the secure sorting protocol (Li et al., 2024b) with the secret shares of
+cosine similarities as input. After execution,Clearns the indicesI K ={I t1 ,It2 , . . . ,ItK }
+of top-Kchunks with the highest cosine similarities.
+5:SandCinvoke the batch PIR-to-share protocol (Song et al., 2025) withD v andI K
+as input, respectively. After execution,SandClearn the secret shares⟨D K⟩of top-K
+chunks corresponding toI t, whereD K ={c t1 ,c t2 , . . . ,ctK }.
+6:Cencrypts⟨D K⟩C toEnc
+ 
+⟨DK⟩C
+using FHE and sends it toS.ScomputesEnc(D K)←
+Enc
+ 
+⟨DK⟩C
++⟨D K⟩S.
+We describe the private semantic similarity protocol ∏PrivateSS (Protocol 1) as follows:
+•Step 1 (Lines 1-2) Private Coarse Matching.To leverage the computational efficiency of Ham-
+ming distance in cryptographic protocols, particularly for large-scale knowledge bases, we first
+5
+
+===== PAGE 6 =====
+Published as a conference paper at ICLR 2026
+translate cosine similarity computations into Hamming distance. Concretely,SandCconvert
+their vector embeddingsv i (i∈[1,N]) andqintoL-bit binary vectorsv b
+i andq b, respectively,
+using SimHash (Charikar, 2002). They then invoke the obvious filter ∏Oblivious Filter (Protocol 3)
+that operates over Hamming space to identify a candidate set of chunks, which is much smaller
+than the full chunk set, without revealing any sensitive information about the query or knowledge
+base.
+•Step 2 (Line 3) Private Cosine Similarity Computation.After identifying the candidate set
+of chunks,SandCperform fine-grained matching by jointly computing the cosine similarity
+between each candidate chunk and the query utilizing MPC protocols (Ma et al., 2023) based on
+secret sharing.
+•Step 3 (Lines 4-6) Encrypted Top-KChunk Retrieval.Given the computed cosine similarities,
+SandCprivately retrieve the corresponding top-Kencrypted chunks. Concretely,Cfirst obtains
+the indices of the top-Kchunks with the highest cosine similarities utilizing a secure sorting pro-
+tocol (Li et al., 2024b).SandCthen retrieve these chunks in secret-shared form utilizing a batch
+PIR-to-share protocol (Song et al., 2025). Finally, they convert the secret shares of top-Kchunks
+into homomorphic encryption ciphertexts. This conversion is optional and depends on the input
+type of the subsequent secure LLM inference framework.
+4.3 PRIVATELEXICALRETRIEVAL
+Lexical matching adopted in this paper considers an alternative scoring metric as described in A.3
+for the top-Kchunks. To achieve lexical matching efficiently and privately, we design an efficient
+private BM25 protocol. We first explore labeled PSI to privately obtain term frequencies for BM25
+scoring. Furthermore, to reduce the overhead of repeatedly invoking labeled PSI for each chunk, we
+introduce a multi-instance labeled PSI protocol ∏MultLPSI (Protocol 4, and the details are shown in
+Appendix D) based on OPRF and OKVS, that computes all per-chunk query term frequencies in a
+single execution.
+We describe the private BM25 protocol ∏PrivateBM25 (Protocol 2) as follows:
+•Step 1 (Lines 1-4) Private BM25 Scores Computation.Firstly,Cprivately obtains the term
+frequency of each query token in each chunk by invoking the multi-instance labeled PSI protocol
+(Protocol 4). From these term frequencies,Ccould compute the document frequency (i.e., the
+number of chunks in whichq j appears) for each query tokenq j. ThenSandCjointly compute
+the BM25 score for each chunk utilizing MPC protocols based on secret sharing (Ma et al., 2023).
+•Step 2 (Lines 5-7) Encrypted Top-KChunk Retrieval.Given the computed BM25 scores,S
+andCprivately retrieve the corresponding top-Kencrypted chunks. This step is similar to Step 3
+in the private similarity matching protocol∏PrivateSS (Protocol 1) and therefore we omit the details
+here.
+4.4 PRIVATEGENERATION
+Piscescan be integrated with various secure LLM inference frameworks.
+Integrate with HE-based Secure Inference Frameworks.As discussed in Section 3.1,Sreceives
+the homomorphically encrypted retrieved chunks along with the encrypted query. It then executes
+the HE-based secure LLM inference framework Rovida & Leporati (2024); Moon et al. (2024) to
+compute an encrypted response, which is subsequently returned toC.
+Integrate with MPC-based Secure Inference Frameworks.SandCavoid converting the secret
+shares of the retrieved chunks into homomorphic ciphertexts, skipping Step 6 of the private semantic
+similarity protocol (Protocol 1) and Step 7 of the private BM25 protocol (Protocol 2). Instead,C
+secret shares its query withS. They then use these shares directly to execute the MPC-based secure
+LLM inference framework (Xu et al., 2025; Lu et al., 2023; Pang et al., 2024), thereby jointly
+computing secret shares of the response.
+Integrate with DP-based Secure Inference Frameworks.Upon receiving both the homomorphi-
+cally encrypted retrieved chunks and the encrypted query,Sinjects differential privacy noise into
+the received encrypted result. This perturbed result is then sent toC, who decrypts it and proceeds
+with the DP-based secure LLM inference framework (Koga et al., 2024) to produce the response.
+6
+
+===== PAGE 7 =====
+Published as a conference paper at ICLR 2026
+Protocol 2: ∏PrivateBM25
+Input:Sinputs the tokenized chunk setD t =
+
+Ii;{w i,l :t f i,l}l∈[1,mi];c i
+	
+i∈[1,N], wherem i is
+the total number of unique tokens ofc i,w i,l is thel-th token of chunkc i andt f D
+i,l is its
+term frequency.Cinputs tokenized queryQ t ={q 1,q 2, . . . ,qn}, wherenis the number
+of tokens inQ.
+Output:Slearns the encrypted top-Kchunks {Enc(ct1 ),Enc(c t2 ), . . . ,Enc(ctK )} with the
+highest BM25 scores.
+1:SandCinvoke the multi-instance labeled PSI protocol ∏MultLPSI (Protocol 4) with
+{wi,l :t f i,l}i∈[1,N],l∈[1,m i] andQ t as input, respectively. After execution,Clearns the
+term frequencyt f ′
+i,j of each tokenq j (j∈[1,n])in each chunkc i (i∈[1,N]), where if
+q j =w i,l,t f ′
+i,j ←t f i,l, and otherwiset f ′
+i,j =0.
+2:Ccomputes the document frequencyd f j ← ∑N
+i=1(t f ′
+i,j >0?1 : 0)for each tokenq j (j∈
+[1,n]).
+3:CandSlocally computes log
+
+1+ N−d f j+0.5
+d f j+0.5
+
+·t f ′
+i,j andk 1 ·
+
+1−b+b·
+Lci
+Lave
+
+, respec-
+tively, fori∈[1,N]andj∈[1,n].
+4:SandCsecure computes the BM25 scores according Equation (1) utilizing MPC pro-
+tocols based on secret sharing (Ma et al., 2023). ThenSandClearns the secret shares
+of BM25 scores, respectively.
+5:SandCinvoke the secure sorting protocol (Li et al., 2024b) with the secret shares of
+BM25 scores as input. After execution,Clearns the indicesI K ={I t1 ,It2 , . . . ,ItK }of
+tok-Kchunks with the highest BM25 scores.
+6:SandCinvoke the batch PIR-to-share protocol (Song et al., 2025) withD v andI K
+as input, respectively. After execution,SandClearn the secret shares⟨D K⟩of top-K
+chunks corresponding tI t, whereD K ={c t1 ,c t2 , . . . ,ctK }.
+7:Cencrypts⟨D K⟩C toEnc
+ 
+⟨DK⟩C
+using FHE and sends it toS.ScomputesEnc(D K)←
+Enc
+ 
+⟨DK⟩C
++⟨D K⟩S.
+5 EXPERIMENTS
+In this section, we first introduce the experimental settings. Then we evaluate the practicality of
+Piscesin two parts: (1) the accuracy ofPiscescompared to the plaintext baseline, and (2) the
+efficiency ofPiscescompared to state-of-the-art cryptographic techniques.
+5.1 EXPERIMENTALSETTINGS
+Embedding Model and Tokenizer.We employ an open-source embedding model, granite-
+embedding-small-english-r22 (Awasthy et al., 2025) to encode chunks and the query into 384-
+dimensional vector representations. Additionally, we utilize an open-source tokenizer BERT 3 (De-
+vlin et al., 2019) for chunk and query tokenization.
+Datasets.We use three datasets: ClapNQ, SQuAD, and HotpotQA as RAG datasets. The details of
+these datasets are shown in Table 7. For the Dev answerable dataset (300 queries in total), we run
+300 queries and take the average to obtain stable results, while for the other datasets, we run 1,000
+queries.
+Baselines.To demonstrate the accuracy ofPisces, we comparePiscesagainst the plaintext
+baseline and DP-based approaches listed in Table 1 under the same RAG architecture. To demon-
+strate efficiency, we compare the semantic retrieval ofPiscesagainst a semantic retrieval baseline
+without coarse matching and the lexical retrieval ofPiscesagainst a lexical retrieval baseline with
+the labeled PSI protocol LSE (Yang et al., 2024).
+2https://huggingface.co/ibm-granite/granite-embedding-small-english-r2
+3https://github.com/google-research/bert
+7
+
+===== PAGE 8 =====
+Published as a conference paper at ICLR 2026
+Environment.All of our experiments are conducted on an Apple M4 Pro machine with 24 GB of
+RAM, running macOS 15.6.1 (24G90).
+5.2 ACCURACYEVALUATION
+We evaluate the accuracy ofPiscesagainst the plaintext baseline through two complementary
+approaches.
+First, for each of the two retrieval paths, we compare the chunks retrieved byPisceswith those
+by the corresponding plaintext retrieval paths. Tables 2 and 3 present semantic and lexical retrieval
+accuracy under the Top-5 and Top-10 settings, respectively, compared to the plaintext baseline.
+The results demonstrate thatPiscesachieves semantic retrieval accuracy ranges from 78.02% to
+90.44% for Top-5, and from 74.86% to 86.83% for Top-10. At the same time, lexical retrieval ac-
+curacy ranges from 85.72% to 98.22 % for Top-5 and from 86.44% to 98.02% for Top-10. The
+accuracy drop in the semantic retrieval path mainly stems from the information loss when approx-
+imating cosine similarity with Hamming distance via SimHash. The slight degradation in lexical
+retrieval accuracy is primarily due to precision loss during secure BM25 score computation.
+Table 2: Semantic retrieval accuracy against the plaintext baseline.
+Dataset Top-5 Top-10
+Accuracy Time (s) Accuracy Time (s)
+ClapNQ
+Dev answerable 87.67% 3.47 86.83% 3.56
+Trainanswerable 80.30% 4.12 77.78% 4.17
+Trainsingleanswerable 90.44% 7.33 81.39% 7.88
+SQuAD Dev v2.0 78.02% 3.37 75.96% 3.41
+Trainingv2.0 78.14% 4.38 74.86% 4.46
+HotpotQA
+Dev distractor 79.90% 18.91 79.80% 20.10
+Dev fullwiki 79.46% 19.27 78.23% 20.76
+Training 82.92% 147.08 81.42% 160.90
+Table 3: Lexical retrieval accuracy against the plaintext baseline.
+Dataset Top-5 Top-10
+Accuracy Time (s) Accuracy Time (s)
+ClapNQ
+Dev answerable 97.47% 1.40 96.53% 1.44
+Trainanswerable 95.62% 2.07 95.13% 2.24
+Trainsingleanswerable 95.64% 5.94 94.99% 6.86
+SQuAD Dev v2.0 97.56% 1.39 97.32% 1.42
+Trainingv2.0 98.22% 2.59 98.02% 2.82
+HotpotQA
+Dev distractor 90.06% 21.46 89.48% 25.02
+Dev fullwiki 90.58% 21.39 89.85% 25.61
+Training 85.72% 238.60 86.44% 265.91
+Second, we evaluate the chunks retrieved by bothPiscesand the plaintext baseline against the
+dataset ground-truth. Figure2 and Figure5 (Appendix F) compare the top-5 and top-10 retrieval ac-
+curacy betweenPiscesand the plaintext baseline, respectively. The results demonstrate that (1)
+Piscesachieves retrieval accuracy comparable to that of the plaintext baseline, and (2) combin-
+ing semantic and lexical retrieval improves overall retrieval performance. Furthermore, we evaluate
+the retrieval accuracy of our proposedPiscesagainst existing DP-based approaches listed in Ta-
+ble 1. The detailed top-5 and top-10 accuracy results, presented in Table 8 and Table 9 respectively,
+demonstrate thatPiscesachieves significantly superior retrieval accuracy compared to DP-based
+approaches.
+8
+
+===== PAGE 9 =====
+Published as a conference paper at ICLR 2026
+ClapNQ_Dev ClapNQ_Train
+ClapNQ_Train_single
+SQuAD_Dev SQuAD_Train
+HotpotQA_Dev_distractorHotpotQA_Dev_fullwiki
+HotpotQA_Training
+0
+20
+40
+60
+80
+100Accuracy (%)
+Retrieval Path
+Semantic
+Lexical
+Dual
+Framework
+Plaintext baseline (filled)
+Pisces (hatched)
+Figure 2: Top-5 Retrieval accuracy comparisons betweenPiscesand plaintext baseline over
+ground-truth.
+5.3 EFFICIENCYEVALUATION
+We evaluate the efficiency of the two retrieval paths ofPisces, respectively.
+Table 4: Efficiency comparisons with Fine-only Strategy
+Dataset Fine-Only Strategy
+Time (s) Upload (MB) Download (MB) Accuracy
+ClapNQ
+Devanswerable 1.855 26.64 36.41 100.00%
+Trainanswerable 2.82 69.47 230.82 99.83%
+Trainsingleanswerable 10.29 278.77 1195.62 99.94%
+SQuAD Devv2.0 1.714 24.06 24.147 99.64%
+Trainv2.0 3.66 87.97 315.18 99.95%
+HotpotQA Devdistractor 34.19 1008.39 4610.26 99.94%
+Devfullwiki 33.91 1031.45 4719.76 99.97%
+Dataset Coarse-to-Fine Strategy
+Time (s) Upload (MB) Download (MB) Accuracy
+ClapNQ
+Devanswerable 3.56 23.95 23.32 86.83%
+Trainanswerable 4.17 36.35 85.64 77.78%
+Trainsingleanswerable 7.88 113.07 442.97 81.39%
+SQuAD Devv2.0 3.41 21.96 13.93 75.96%
+Trainv2.0 4.46 43.51 118.29 74.86%
+HotpotQA Devdistractor 20.10 324.90 1439.70 79.80%
+Devfullwiki 20.76 330.69 1467.45 78.23%
+For the semantic retrieval path, we evaluate the efficiency of our proposed coarse-to-fine strategy
+against a fine-only baseline (without coarse matching), with both implemented using encrypted com-
+putations. The results shown in Table 4 demonstrate that for a large-scale dataset, the coarse-to-fine
+strategy significantly saves retrieval time by 38.78%∼41.21%, reduces the upload and download
+overhead by 67.53%∼67.78% and 68.49%∼68.77%, respectively. In contrast, on small-scale
+datasets, the fine-only strategy outperforms ours, as the coarse matching step itself, rather than co-
+sine similarity computation, becomes the computational bottleneck.
+For the lexical retrieval path, we evaluate the efficiency of our proposed multi-instance labeled
+PSI protocol ∏MultLPSI (Protocol 4) with the state-of-the-art labeled PSI protocol LSE (Yang et al.,
+9
+
+===== PAGE 10 =====
+Published as a conference paper at ICLR 2026
+Table 5: Efficiency comparisons with labeled PSI
+Dataset Labeled PSI
+Time (s) Upload (MB) Download (MB)
+ClapNQ
+Devanswerable 3.89 1.62 0.60
+Trainanswerable 27.57 4.21 11.35
+Trainsingleanswerable 138.89 21.22 57.77
+SQuAD Devv2.0 3.15 0.48 2.03
+Trainv2.0 45.89 6.99 30.05
+HotpotQA Devdistractor 1051.98 161.61 382.26
+Devfullwiki 1179.58 176.89 414.16
+Dataset Multi-instance Labeled PSI
+Time (s) Upload (MB) Download (MB)
+ClapNQ
+Devanswerable 0.009 0.0003 0.58
+Trainanswerable 0.056 0.0003 4.00
+Trainsingleanswerable 0.28 0.0003 21.04
+SQuAD Devv2.0 0.008 0.0004 1.49
+Trainv2.0 0.099 0.0004 22.64
+HotpotQA Devdistractor 2.35 0.0006 79.82
+Devfullwiki 2.59 0.0006 81.44
+2024). The results shown in Table 4 demonstrate that our proposed multi-instance labeled PSI
+outperforms LSE by up to 496.03×, 70733×, and 2.84×in running time, upload overhead, and
+download overhead, respectively.
+6 RELATED WORK
+RAG with Dual-Path Retrieval.Multiple works (Kuzi et al., 2020; Gao et al., 2021; Li et al., 2022)
+demonstrate that leveraging semantic and lexical retrieval together significantly improves retrieval
+performance. Inspired by this, we aim to designPiscesthat privately supports dual-path retrieval
+to guarantee the retrieval accuracy.
+RAG with Retrieval Process Protection.Recent work applies differential privacy by injecting
+noise into embeddings to protect privacy during the retrieval process. Several works (Grislain,
+2025; He et al., 2025) focus on protecting documents during the semantic retrieval, while Cheng
+et al. (Cheng et al., 2025) propose RemoteRAG to protect the query. Yao and Li (Yao & Li, 2025)
+further attempt to protect both the query and documents. However, all of these works only consider
+a single retrieval path, i.e., semantic retrieval. In contrast,Piscessupports dual-path retrieval,
+semantic and lexical, while protecting both the query and documents.
+7 CONCLUSION
+In this paper, we proposePisces, the first practical cryptography-based RAG framework that sup-
+ports dual-path retrieval while protecting both the query and documents. We design novel crypto-
+graphic protocols tailored for efficient semantic and lexical retrieval: a coarse-to-fine semantic strat-
+egy that employs a novel oblivious filter over Hamming distance, and an efficient multi-instance
+labeled PSI protocol that obtains BM25 term frequencies in a single execution. We comprehen-
+sively evaluatePiscesand find only a 1.87% deviation in retrieval accuracy relative to plaintext
+baselines. On large-scale datasets, our coarse-to-fine strategy reduces runtime by 41.21% and up-
+load/download overhead by 68.77% compared to a fine-only strategy. Our proposed multi-instance
+labeled PSI further outperforms LSE by up to 496.03×in runtime, 70733×in upload overhead.
+These results demonstrate thatPiscesis both accurate and efficient.
+10
+
+===== PAGE 11 =====
+Published as a conference paper at ICLR 2026
+REFERENCES
+Josh Achiam, Steven Adler, Sandhini Agarwal, Lama Ahmad, Ilge Akkaya, Florencia Leoni Ale-
+man, Diogo Almeida, Janko Altenschmidt, Sam Altman, Shyamal Anadkat, et al. Gpt-4 technical
+report. arXiv preprint arXiv:2303.08774, 2023.
+Parul Awasthy, Aashka Trivedi, Yulong Li, Meet Doshi, Riyaz Bhat, Vishwajeet Kumar, Yushu
+Yang, Bhavani Iyer, Abraham Daniels, Rudra Murthy, et al. Granite embedding r2 models.arXiv
+preprint arXiv:2508.21085, 2025.
+Alexander Bienstock, Sarvar Patel, Joon Young Seo, and Kevin Yeo. Batch{PIR}and labeled{PSI}
+with oblivious ciphertext compression. In33rd USENIX Security Symposium (USENIX Security
+24), pp. 5949–5966, 2024.
+Moses S Charikar. Similarity estimation techniques from rounding algorithms. In Proceedings of
+the thiry-fourth annual ACM symposium on Theory of computing, pp. 380–388, 2002.
+Hao Chen, Zhicong Huang, Kim Laine, and Peter Rindal. Labeled psi from fully homomorphic
+encryption with malicious security. In Proceedings of the 2018 ACM SIGSAC Conference on
+Computer and Communications Security, pp. 1223–1237, 2018.
+Yihang Cheng, Lan Zhang, Junyang Wang, Mu Yuan, and Yunhao Yao. Remoterag: A privacy-
+preserving llm cloud rag service. arXiv preprint arXiv:2412.12775, 2024.
+Yihang Cheng, Lan Zhang, Junyang Wang, Mu Yuan, and Yunhao Yao. RemoteRAG: A privacy-
+preserving LLM cloud RAG service. In Wanxiang Che, Joyce Nabende, Ekaterina Shutova, and
+Mohammad Taher Pilehvar (eds.), Findings of the Association for Computational Linguistics:
+ACL 2025, pp. 3820–3837, Vienna, Austria, July 2025. Association for Computational Linguis-
+tics. ISBN 979-8-89176-256-5. doi: 10.18653/v1/2025.findings-acl.197.
+Kelong Cong, Radames Cruz Moreno, Mariana Botelho da Gama, Wei Dai, Ilia Iliashenko, Kim
+Laine, and Michael Rosenberg. Labeled psi from homomorphic encryption with reduced compu-
+tation and communication. In Proceedings of the 2021 ACM SIGSAC Conference on Computer
+and Communications Security, pp. 1135–1150, 2021.
+National People’s Congress. Personal information protection law of the people’s republic of china,
+a. URLhttp://en.npc.gov.cn.cdurl.cn/2021-12/29/c_694559.htm.
+United States Congress. Health insurance portability and accountability act, b. URLhttp://
+www.cms.hhs.gov/hipaa/.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. Bert: Pre-training of deep
+bidirectional transformers for language understanding. In Proceedings of the 2019 conference
+of the North American chapter of the association for computational linguistics: human language
+technologies, volume 1 (long and short papers), pp. 4171–4186, 2019.
+Michael J Freedman, Yuval Ishai, Benny Pinkas, and Omer Reingold. Keyword search and obliv-
+ious pseudorandom functions. In Theory of Cryptography: Second Theory of Cryptography
+Conference, TCC 2005, Cambridge, MA, USA, February 10-12, 2005. Proceedings 2, pp. 303–
+324. Springer, 2005.
+Luyu Gao, Zhuyun Dai, Tongfei Chen, Zhen Fan, Benjamin Van Durme, and Jamie Callan. Com-
+plement lexical retrieval model with semantic residual embeddings. In European Conference on
+Information Retrieval, pp. 146–160. Springer, 2021.
+Yunfan Gao, Yun Xiong, Xinyu Gao, Kangxiang Jia, Jinliu Pan, Yuxi Bi, Yixin Dai, Jiawei Sun,
+Haofen Wang, and Haofen Wang. Retrieval-augmented generation for large language models: A
+survey. arXiv preprint arXiv:2312.10997, 2(1), 2023.
+Gayathri Garimella, Benny Pinkas, Mike Rosulek, Ni Trieu, and Avishay Yanai. Oblivious key-
+value stores and amplification for private set intersection. In Advances in Cryptology–CRYPTO
+2021: 41st Annual International Cryptology Conference, CRYPTO 2021, Virtual Event, August
+16–20, 2021, Proceedings, Part II 41, pp. 395–425. Springer, 2021.
+11
+
+===== PAGE 12 =====
+Published as a conference paper at ICLR 2026
+Nicolas Grislain. Rag with differential privacy. In 2025 IEEE Conference on Artificial Intelligence
+(CAI), pp. 847–852. IEEE, 2025.
+Longzhu He, Peng Tang, Yuanhe Zhang, Pengpeng Zhou, and Sen Su. Mitigating privacy risks in
+retrieval-augmented generation via locally private entity perturbation. Information Processing &
+Management, 62(4):104150, 2025.
+Lei Huang, Weijiang Yu, Weitao Ma, Weihong Zhong, Zhangyin Feng, Haotian Wang, Qianglong
+Chen, Weihua Peng, Xiaocheng Feng, Bing Qin, et al. A survey on hallucination in large language
+models: Principles, taxonomy, challenges, and open questions.ACM Transactions on Information
+Systems, 43(2):1–55, 2025.
+Yangsibo Huang, Samyak Gupta, Zexuan Zhong, Kai Li, and Danqi Chen. Privacy implications of
+retrieval-based language models. arXiv preprint arXiv:2305.14888, 2023.
+Stanisław Jarecki and Xiaomin Liu. Fast secure computation of set intersection. In International
+Conference on Security and Cryptography for Networks, pp. 418–435. Springer, 2010.
+Zhengbao Jiang, Frank F Xu, Luyu Gao, Zhiqing Sun, Qian Liu, Jane Dwivedi-Yu, Yiming Yang,
+Jamie Callan, and Graham Neubig. Active retrieval augmented generation. In Proceedings of the
+2023 Conference on Empirical Methods in Natural Language Processing, pp. 7969–7992, 2023.
+Marcel Keller. Mp-spdz: A versatile framework for multi-party computation. In Proceedings of
+the 2020 ACM SIGSAC conference on computer and communications security, pp. 1575–1590,
+2020.
+Tatsuki Koga, Ruihan Wu, and Kamalika Chaudhuri. Privacy-preserving retrieval-augmented gen-
+eration with differential privacy. arXiv preprint arXiv:2412.04697, 2024.
+Saar Kuzi, Mingyang Zhang, Cheng Li, Michael Bendersky, and Marc Najork. Leveraging semantic
+and lexical matching to improve the recall of document retrieval systems: A hybrid approach.
+arXiv preprint arXiv:2010.01195, 2020.
+Patrick Lewis, Ethan Perez, Aleksandra Piktus, Fabio Petroni, Vladimir Karpukhin, Naman Goyal,
+Heinrich K¨uttler, Mike Lewis, Wen-tau Yih, Tim Rockt¨aschel, et al. Retrieval-augmented gener-
+ation for knowledge-intensive nlp tasks. Advances in neural information processing systems, 33:
+9459–9474, 2020.
+Hang Li, Shuai Wang, Shengyao Zhuang, Ahmed Mourad, Xueguang Ma, Jimmy Lin, and Guido
+Zuccon. To interpolate or not to interpolate: Prf, dense and sparse retrievers. InProceedings of the
+45th international ACM SIGIR conference on research and development in information retrieval,
+pp. 2495–2500, 2022.
+Jiarui Li, Ye Yuan, and Zehua Zhang. Enhancing llm factual accuracy with rag to counter hallu-
+cinations: A case study on domain-specific queries in private knowledge-bases. arXiv preprint
+arXiv:2403.10446, 2024a.
+Jingyu Li, Zhicong Huang, Min Zhang, Jian Liu, Cheng Hong, Tao Wei, and Wenguang Chen.
+Panther: Private approximate nearest neighbor search in the single server setting. Cryptology
+ePrint Archive, 2024b.
+Aixin Liu, Bei Feng, Bing Xue, Bingxuan Wang, Bochao Wu, Chengda Lu, Chenggang Zhao,
+Chengqi Deng, Chenyu Zhang, Chong Ruan, et al. Deepseek-v3 technical report. arXiv preprint
+arXiv:2412.19437, 2024.
+Wen-jie Lu, Zhicong Huang, Zhen Gu, Jingyu Li, Jian Liu, Cheng Hong, Kui Ren, Tao Wei, and
+WenGuang Chen. Bumblebee: Secure two-party inference framework for large transformers.
+Cryptology ePrint Archive, 2023.
+Xing Han L `u. Bm25s: Orders of magnitude faster lexical search via eager sparse scoring. arXiv
+preprint arXiv:2407.03618, 2024.
+12
+
+===== PAGE 13 =====
+Published as a conference paper at ICLR 2026
+Junming Ma, Yancheng Zheng, Jun Feng, Derun Zhao, Haoqi Wu, Wenjing Fang, Jin Tan, Chaofan
+Yu, Benyu Zhang, and Lei Wang.{SecretFlow-SPU}: A performant and{User-Friendly}frame-
+work for{Privacy-Preserving}machine learning. In 2023 USeNIX annual technical conference
+(USeNIX ATC 23), pp. 17–33, 2023.
+Jungho Moon, Dongwoo Yoo, Xiaoqian Jiang, and Miran Kim. Thor: Secure transformer inference
+with homomorphic encryption. Cryptology ePrint Archive, 2024.
+Moni Naor, Benny Pinkas, and Omer Reingold. Distributed pseudo-random functions and kdcs. In
+International conference on the theory and applications of cryptographic techniques, pp. 327–346.
+Springer, 1999.
+Qi Pang, Jinhao Zhu, Helen M ¨ollering, Wenting Zheng, and Thomas Schneider. Bolt: Privacy-
+preserving, accurate and efficient inference for transformers. In 2024 IEEE Symposium on
+Security and Privacy (SP), pp. 4753–4771. IEEE, 2024.
+Stephen Robertson, Hugo Zaragoza, et al. The probabilistic relevance framework: Bm25 and be-
+yond. Foundations and Trends® in Information Retrieval, 3(4):333–389, 2009.
+Lorenzo Rovida and Alberto Leporati. Transformer-based language models and homomorphic en-
+cryption: An intersection with bert-tiny. In Proceedings of the 10th ACM International Workshop
+on Security and Privacy Analytics, pp. 3–13, 2024.
+Adi Shamir. How to share a secret. Communications of the ACM, 22(11):612–613, 1979.
+Lushan Song, Qizhi Zhang, Yu Lin, Haoyu Niu, Daode Zhang, Zheng Qu, Weili Han, Jue Hong,
+Quanwei Cai, and Ye Wu. Suda: An efficient and secure unbalanced data alignment framework for
+vertical{Privacy-Preserving}machine learning. In 34th USENIX Security Symposium (USENIX
+Security 25), pp. 7663–7682, 2025.
+Paul V oigt and Axel V on dem Bussche. The EU General Data Protection Regulation (GDPR).
+Springer, New York, USA, 2017.
+Tianshi Xu, Wen-jie Lu, Jiangrui Yu, Yi Chen, Chenqi Lin, Runsheng Wang, and Meng Li. Breaking
+the layer barrier: Remodeling private transformer inference with hybrid{CKKS}and{MPC}. In
+34th USENIX Security Symposium (USENIX Security 25), pp. 2653–2672, 2025.
+Yunbo Yang, Yiwei Hu, Ruofan Li, Xiaolei Dong, Zhenfu Cao, Jiachen Shen, and Shangmin Dou.
+Lse: Efficient symmetric searchable encryption based on labeled psi. IEEE Transactions on
+Services Computing, 17(2):563–574, 2024.
+Dixi Yao and Tian Li. Private retrieval augmented generation with random projection. In ICLR
+2025 Workshop on Building Trust in Language Models and Applications, 2025.
+Shenglai Zeng, Jiankun Zhang, Pengfei He, Yue Xing, Yiding Liu, Han Xu, Jie Ren, Shuaiqiang
+Wang, Dawei Yin, Yi Chang, et al. The good and the bad: Exploring privacy issues in retrieval-
+augmented generation (rag). arXiv preprint arXiv:2402.16893, 2024.
+Yanzhao Zhang, Mingxin Li, Dingkun Long, Xin Zhang, Huan Lin, Baosong Yang, Pengjun Xie,
+An Yang, Dayiheng Liu, Junyang Lin, et al. Qwen3 embedding: Advancing text embedding and
+reranking through foundation models. arXiv preprint arXiv:2506.05176, 2025.
+A DETAILEDPRELIMINARIES
+A.1 CRYPTOGRAPHICPRIMITIVES
+A.1.1 SECERTSHARING
+Secret sharing (Shamir, 1979; Keller, 2020)is one of the critical primitives of MPC. In this paper,
+we adopt 2-out-of-2 arithmetic secret sharing technology. The main idea of it is to break a secret
+value into 2 shares, each of which is held by a party. For example,S, who holds the secret value
+x∈F p, wants to secret share this secret value with another partyC. To do this,P S first generates a
+random valuer∈F p as its share⟨x⟩ S =r, and then sends⟨x⟩ C =x−rmodF p to another partyC.
+Thereforex=⟨x⟩ S +⟨x⟩ C modF p, which, for simplicity, we denote asx=⟨x⟩ S +⟨x⟩ C.
+13
+
+===== PAGE 14 =====
+Published as a conference paper at ICLR 2026
+A.1.2 LABELEDPRIVATESETINTERSECTION
+The PSI (Jarecki & Liu, 2010) allows two parties, a serverSand a clientC, to learn the intersection
+of their respective element sets without revealing any additional information outside the intersection.
+Labeled PSI (Chen et al., 2018; Bienstock et al., 2024; Cong et al., 2021) extends the traditional PSI
+by allowing the serverSto associate a label with each element, and the clientClearns the labels for
+elements in the intersection. Formally,Sinputs a set of key-value pairs{(x i,l(x i))}, wherex i is an
+element andl(x i)is its corresponding label, whileCinputs a set of keyY. After execution,Clearns
+a set of pairs{(y,l(y))}fory∈X∩Y.
+A.1.3 OBLIVIOUSPSEUDORANDOMFUNCTION
+The OPRF (Freedman et al., 2005) is a cryptographic primitive that enables two parties, a serverS
+and a clientC, to jointly compute a pseudorandom function (PRF)F ·(·). As shown in Figure 3,S
+takes a PRF keykas input and learns nothing, whileCtakesxas input and learns the PRF value
+Fk(x). Moreover,Clearns nothing about the PRF keykandSlearns nothing about the input or the
+output ofC.
+FunctionalityF OPRF
+Parameters:Two partiesSandC. A PRFF ·(·).
+Functionality:
+• Wait for inputkfromS, wherekis a PRF key.
+• Wait for inputxfromC.
+• OutputF k(x)toC.
+Figure 3: Ideal functionality of OPRF
+A.1.4 OBVIOUSLYKEY-VALUESTORE
+The OKVS (Garimella et al., 2021) is a data structure that encodes a set of key-value pairs into a
+compact representation while preserving the privacy of both keys and values. The definition is as
+follows:
+Definition 1(Oblivious Key-Value Store).An OKVS parameterized by a key spaceKand a value
+Vspace, and consists of two algorithms:
+•Γor⊥ ←Encode((k 1,v 1),(k 2,v 2), . . . ,(kn,v n)): The encode algorithm takes n key–value
+pairs{(k 1,v 1),(k 2,v 2), . . . ,(kn,v n)} ⊂ {K × V}n as input, and outputs a structureΓ(or an
+error terminator⊥with negligible probability).
+•v←Decode(Γ,k): The decode algorithm takes an OKVS structureΓand a key k∈ Kas
+input, and outputs the corresponding value v∈ V.
+Correctness:An OKVS is correct if, for allX⊂ K × Vwith distinct keys such that Encode(X) =
+Γ̸=⊥and(k,v)∈X, it holds that Decode(Γ,k) =v;
+Computationally Obliviousness:An OKVS is computationally oblivious if, for any two
+key sets withndistinct keysK={k 1,k 2, . . . ,kn} ⊂ KandK ′ ={k ′
+1,k ′
+2, . . . ,k′
+n} ⊂ Kand
+a uniformly random value setV={v 1,v 2, . . . ,vn} ⊂ V, a probabilistic polynomial-time ad-
+versary is not able to distinguish between Encode((k 1,v 1),(k 2,v 2), . . . ,(kn,v n)) =Γ̸=⊥and
+Encode((k′
+1,v 1),(k ′
+2,v 2), . . . ,(k′
+n,v n)) =Γ ′ ̸=⊥.
+This computationally obliviousness property ensures that the OKVS reveals no information about
+the encoded keys or values beyond the decoded results for given keys.
+A.1.5 BATCHPRIVATEINFORMATIONRETRIEVAL-TO-SHARE
+The PIR-to-share (Song et al., 2025) is a cryptographic primitive that enables a clientCto pri-
+vately retrieve the values corresponding to its queries from the serverS. After that,SandC
+14
+
+===== PAGE 15 =====
+Published as a conference paper at ICLR 2026
+obtain the secret shares of queried values, respectively. As shown in Figure 4,Stakes its data
+Dof sizeNas input, whileCtakes its queriesI={I 1,I2, . . . ,Ib}(index set) as input.Slearns
+data shares⟨D[I 1]⟩S,⟨D[I2]⟩S, . . . ,⟨D[Ib]⟩S corresponding toC’s queries andClearns data shares
+⟨D[I1]⟩C,⟨D[I2]⟩C, . . . ,⟨D[Ib]⟩C. During this process,Slearns nothing aboutC’s queries, andConly
+learns the secret shares of the retrieved values rather than the raw data ofS.
+FunctionalityF PIR2Share
+Parameters:Two partiesSandC.
+Functionality:
+• Wait for inputDfromS.
+• Wait for inputI={I 1,I2, . . . ,Ib}fromC.
+• Sample⟨D[I 1]⟩S,⟨D[I2]⟩S, . . . ,⟨D[Ib]⟩S and⟨D[I 1]⟩C,⟨D[I2]⟩C, . . . ,⟨D[Ib]⟩C uniformly, such that
+⟨D[I1]⟩S +⟨D[I 1]⟩C =⟨D[I 1]⟩, . . . ,⟨D[Ib]⟩S +⟨D[I b]⟩C =⟨D[I b]⟩.
+• Output the shares⟨D[I 1]⟩S,⟨D[I2]⟩S, . . . ,⟨D[Ib]⟩S toP S and⟨D[I 1]⟩C,⟨D[I2]⟩C, . . . ,⟨D[Ib]⟩C to
+PC.
+Figure 4: Ideal functionality ofF PIR2Share
+A.2 SEMANTICSIMILARITY
+Semantic similarity (Awasthy et al., 2025; Zhang et al., 2025) is a measure of the degree to which
+the meanings of two linguistic units, such as words, phrases, sentences, or documents, are alike,
+based on their semantic content rather than lexical matching. It plays a fundamental role in many
+natural language processing tasks, including information retrieval and text summarization. Contem-
+porary methods operationalize meaning via vector representations. Similarity is then measured with
+distance functions in embedding space, such as cosine similarity, Hamming distance, and Euclidean
+distance. In this paper, we choose cosine similarity as our similarity metric.
+A.3 BESTMATCHING25
+A popular algorithm to achieve lexical retrieval is BM25 (Robertson et al., 2009; L `u, 2024), which
+is a probabilistic information retrieval algorithm widely used to rank documents according to their
+relevance to a given query. It is an enhancement to the traditional term frequency-inverse document
+frequency (TF-IDF) algorithm, which measures the importance of a term within a set of documents.
+BM25 takes document length into account and introduces a saturation function to term frequencies,
+which helps prevent common terms from dominating the results to improve the ranking accuracy.
+Given a document setD={d 1,d 2, . . . ,dN}and a queryQ={q 1,q 2, . . . ,qn}, whered i denotes the
+i-th document inD,Nis the total number of documents inD,q j is thej-th term inQ,nis the total
+number of terms inQ, the BM25 relevance score for documentd i relative to this query is defined as:
+Score(Q,d i) =
+n
+∑
+j=1
+IDF(q j)·R(q j,d i)
+=
+n
+∑
+j=1
+log
+
+1+ N−d f j +0.5
+d f j +0.5
+
+· t fi,j
+t fi,j +k 1 ·
+
+1−b+b·
+Ldi
+Lave
+
+(1)
+where IDF(q j)is the inverse document frequency ofq j andR(q j,d)is the relevance score for the
+documentd i relative to the termq j. Besides,d f j is the document frequency for termq j, i.e. the
+number of documents in the document setDin whichq j appears,t f i,j is the term frequency ofq j in
+the documentd i,L di is the length of the documentd i,L ave is the average length of the document set
+D,k 1 >0 and 0<b<1 are constant values,k 1 controls the saturation of the term frequency andb
+adjusts the impact of normalization of document length.
+B NOTATION
+We summarize the frequently used notation in Table 6.
+15
+
+===== PAGE 16 =====
+Published as a conference paper at ICLR 2026
+Table 6: Notation Table
+Symbol Description
+SThe server, who holds a sensitive knowledge base.
+CThe user, who holds a private query.
+DDocument set in the knowledge base.
+QQuery.
+NChunk number ofD.
+nUnique token number ofQ.
+ci i-th chunk.
+Ii Index of chunkc i.
+vi Vector representation of chunkc i.
+mUnique token number of chunkc i.
+wi,l l-th token of chunkc i.
+t fi,l Term frequency ofw i,l in chunkc i.
+Dv = {Ii;v i;c i}i∈[1,N] Embedded chunk set.
+Dt =
+
+Ii;{w i,l :t f i,l}l∈[1,mi];c i
+	
+i∈[1,N] Tokenized chunk set.
+q j j-th token of queryQ.
+qVector representation of queryQ.
+Qt ={q 1,q 2, . . . ,qn}Tokenized query.
+C OBLIVIOUS FILTER
+The core idea of the oblivious filter is to convert an approximate (fuzzy) matching problem into an
+exact matching task. The detailed oblivious filter protocol is shown in Protocol 3. In this protocol,
+both the serverSand the userCselect the same projections to mask their binary vector(s). A chunk
+is considered a candidate match if its projected binary vectors match the query’s projected binary
+vectors on at least two projections. This protocol allows the serverSto identify a candidate set of
+chunks that are likely to match the query.
+To privately achieve the above matching, we employ a 2-out-of-T Shamir secret sharing scheme. The
+clientCcan only reconstruct a secret value if it obtains at least two shares for a chunk. Furthermore,
+to prevent the client to learn which specific chunks are matched, the serverSencrypts all shares
+with additive HE. As a result, the client would reconstruct the secret in ciphertext, which ensures
+the client could not learn any information throughout the oblivious filter.
+D MULTI-INSTANCELABELEDPRIVATESETINTERSECTION
+We design a customized multi-instance labeled PSI protocol (Protocol 4) to support repeated invoca-
+tions of labeled PSI with the same small client query set. This protocol features two key innovations.
+First, the setup phase only involves the serverSand produces a reusable OKVS structureΓ. It can
+be efficiently reused across multiple queries without recomputation. Second, the interactive phase
+minimizes computational overhead. It only requires a single, small-scale OPRF execution per query,
+independent of the server’s data size. These optimizations significantly reduce both communication
+and computation costs compared to conventional labeled PSI protocols.
+E DETAILEDDATASET
+Table 7 shows the details of the datasets used in this paper, including the number of documents and
+the number of chunks.
+16
+
+===== PAGE 17 =====
+Published as a conference paper at ICLR 2026
+Protocol 3: ∏Oblivious Filter
+Input:Sinputs the setD v =
+
+(Ii,v b
+i ,c i)
+	
+i∈[1,N], whereI i is the binary vector representation
+corresponding to the chunkc i.Cinputs binary vectorq b ∈ {0,1} L.
+Output:Slearns a candidate setD ′ =
+n
+(I′
+i ,v b
+i
+′,c ′
+i)
+o
+i∈[1,N]
+, where for alli∈[1,N ′],
+HD(vb
+i
+′,q b)≤t(i.e., Hamming distance at mostt).
+Setup Phase:
+1:Sgenerates a random keypair(pk,sk)for an additive HE scheme.
+2:Ssets the projection weightℓ← ⌈
+√
+t· L⌉and the number of projectionsT←160.S
+randomly selectsTprojection masks{m i ∈ {0,1} L}i∈[1,T] such that∥m i∥=ℓfor all
+i∈[1,T].
+3:Sselects 2Nrandom numbers{x i}i∈[1,N] and{s i}i∈[1,N], and initializes an empty collec-
+tionC.
+4:Sselects a random linear polynomialP i(x) =ax+s i with random coefficientafori∈
+[1,N].
+5:Scomputes ciphertextv i,j ←Enc(pk,P i(x j))and keyk i,j ←Hash(v b
+i ∧m j)fori∈
+[1,N],j∈[1,T].
+6:Sinserts the pair(k i,j ,v i,j )intoC.
+7:SinvokesOKVS.Encode(C)to obtain the OKVS structureΓ.
+Interactive Phase:
+1:Ssends the public keypk, projection masks{m i}i∈[1,T] , OKVS structureΓ, and random
+numbers{x i}i∈[1,T] toC.
+2:Ccomputest j ←Hash(q b ∧m j)forj∈[1,T]1.
+3:CinvokesOKVS.Decode(Γ,{t j}i∈[1,T] )to obtain{d i}i∈[1,T] .
+4:Ccomputes a candidate secret ciphertext:s i,j ←d j −x j · di−d j
+xi−x j for each combination
+(i,j)from the
+ T
+2
+
+possible pairs of indices from[1,T].
+5:Cshuffles all computed ciphertexts{s i,j }to form the setSand sendsStoS.
+6:SdecryptsSto obtainP← {Dec(sk,s)|s∈S}.
+7:For eachs i (from the original setup) that appears inP,Sadds the corresponding item
+(Ii,v b
+i ,c i)to the result setD ′.
+8:SreturnsD ′ as the final result.
+Table 7: Details of datasets we evaluated in this paper. “Documents” denotes the number of docu-
+ments in the dataset, and “Chunks” denotes the number of chunks generated from breaking down all
+the documents in the dataset.
+Dataset Documents Chunks
+ClapNQ
+Dev answerable 290 1990
+Train answerable 1751 14010
+Train single answerable 8996 71363
+SQuAD Dev v2.0 35 1204
+Training v2.0 442 19029
+HotpotQA
+Dev distractor 66581 269602
+Dev fullwiki 66573 276013
+Training 482021 1795146
+F SUPPLEMENTARYACCURACYEXPERIMENTALRESULTS
+The top-10 retrieval accuracy comparison betweenPiscesand plaintext baseline is shown in Fig-
+ure 5. Furthermore, we evaluate the retrieval accuracy of our proposedPiscesagainst existing
+DP-based approaches listed in Table 1. The detailed top-5 and top-10 accuracy results, presented in
+17
+
+===== PAGE 18 =====
+Published as a conference paper at ICLR 2026
+Protocol 4: ∏MultLPSI
+Input:Sinputs setD t ={w i,l :t f i,l}i∈[1,N],l∈[1,m i].Cinputs setQ t ={q 1,q 2, . . . ,qn}.
+Output:Clearns{t f ′
+i,j }i∈[1,N]],j∈[1,n] , where ifq j =w i,l thent f ′
+i,j =t f i,l, and otherwise
+t f ′
+i,j =0.
+Setup Phase:
+1:Sselects a random PRF keykand two key derivation functionsKDF 0 andKDF 1.
+2:Sinitializes an empty setS.
+3:Scomputesr i,l ←PRF(k,w i,l),k i,l ←KDF 0(i,r i,l),m i,l ←KDF 1(i,r i,l)andc i,l ←
+AES.Enc(mi,l,0 ℓ ∥t f i,l)fori∈[1,N],l∈[1,m i].
+4:Sinserts the key-value pair(k i,l,c i,l)intoSfori∈[1,N],l∈[1,m i].
+5:SinvokesOKVS.Encode(S)to obtain the OKVS structureΓ.
+Interactive Phase:
+1:Ssends the OKVS structureΓand key derivation functionsKDF 0,KDF 1 toC.
+2:SandCinvoke an OPRF protocol with PRF keykandQ t ={q 1,q 2, . . . ,qn}as inputs,
+respectively. After execution,Cobtains the PRF resultsD={d 1,d 2, . . . ,dn}.
+3:CinitializesK i =/ 0 andMi =/ 0 fori∈[1,N].
+4:Ccomputesk ′
+i,j ←KDF 0(i,d j)andm ′
+i,j ←KDF 1(i,d j)fori∈[1,N],j∈[1,n].
+5:Caddsk ′
+i,j toK i andm ′
+i,j toM i fori∈[1,N],j∈[1,n].
+6:CinvokesOKVS.Decode(Γ,K i)to obtain ciphers{c i,j }i∈[1,N],j∈[1,n] .
+7:Ccomputesp i,j ←AES.Dec(m ′
+i,j ,c i,j )fori∈[1,N],j∈[1,n].
+8:Ifp i,j starts with 0 ℓ (whereℓis a security parameter),Cparsesp i,j as 0ℓ ∥v i,j and set
+t f ′
+i,j ←v i,j . Otherwise, sett f ′
+i,j ←0.
+9:Creturns{t f ′
+i,j }i∈[1,N],j∈[1,n] as the result.
+Table 8 and Table 9 respectively. Following the original papers, we configure the privacy parameters
+as:ε=1 for DP-RAG (Grislain, 2025),ε=1280 for RemoteRAG (Cheng et al., 2024), andσ=0.1
+for (Yao & Li, 2025).
+ClapNQ_Dev ClapNQ_Train
+ClapNQ_Train_single
+SQuAD_Dev SQuAD_Train
+HotpotQA_Dev_distractorHotpotQA_Dev_fullwiki
+HotpotQA_Training
+0
+20
+40
+60
+80
+100Accuracy (%)
+Retrieval Path
+Semantic
+Lexical
+Dual
+Framework
+Plaintext baseline (filled)
+Pisces (hatched)
+Figure 5: Top-10 retrieval accuracy comparison betweenPiscesand plaintext baseline over
+ground-truth.
+18
+
+===== PAGE 19 =====
+Published as a conference paper at ICLR 2026
+Table 8: Top-5 retrieval accuracy comparison betweenPiscesand baselines over ground-truth.
+Results for DP-RAG (Grislain, 2025) usesε=1, RemoteRAG (Cheng et al., 2024) usesε=1280,
+and (Yao & Li, 2025) usesσ=0.1.
+Dataset Framework Top-5
+Semantic Lexical Dual-Path
+ClapNQ
+Devanswerable
+Plaintext 36.38% 47.42% 59.66%
+DP-RAG (Grislain, 2025) 26.37% - 26.37%
+RemoteRAG (Cheng et al., 2024) 35.54% - 35.54%
+(Yao & Li, 2025) 15.45% - 15.45%
+Pisces30.14% 47.15%58.05%
+Trainanswerable
+Plaintext 22.99% 36.78% 45.78%
+DP-RAG (Grislain, 2025) 17.47% - 17.47%
+RemoteRAG (Cheng et al., 2024) 22.39% - 22.39%
+(Yao & Li, 2025) 6.68% - 6.68%
+Pisces19.22% 36.72%44.41%
+Trainsingleanswerable
+Plaintext 27.57% 40.12% 50.56%
+DP-RAG (Grislain, 2025) 21.31% - 21.31%
+RemoteRAG (Cheng et al., 2024) 26.52% - 26.52%
+(Yao & Li, 2025) 4.41% - 4.41%
+Pisces23.44% 39.82%49.39%
+SQuAD
+Devv2.0
+Plaintext 33.80% 91.90% 93.30%
+DP-RAG (Grislain, 2025) 24.74% - 24.74%
+RemoteRAG (Cheng et al., 2024) 33.18% - 33.18%
+(Yao & Li, 2025) 14.78% - 14.78%
+Pisces25.20% 91.60%93.10%
+Trainingv2.0
+Plaintext 26.4% 81.10% 84.80%
+DP-RAG (Grislain, 2025) 20.34% - 20.34%
+RemoteRAG (Cheng et al., 2024) 25.48% - 25.48%
+(Yao & Li, 2025) 9.08% - 9.08%
+Pisces17.40% 80.90%84.10%
+HotpotQA
+Devdistractor
+Plaintext 7.28% 43.62% 46.27%
+DP-RAG (Grislain, 2025) 5.70% - 5.70%
+RemoteRAG (Cheng et al., 2024) 7.09% - 7.09%
+(Yao & Li, 2025) 1.27% - 1.27%
+Pisces6.57% 43.60%46.08%
+Devfullwiki
+Plaintext 4.99% 34.86% 36.44%
+DP-RAG (Grislain, 2025) 3.87% - 3.87%
+RemoteRAG (Cheng et al., 2024) 4.97% - 4.97%
+(Yao & Li, 2025) 1.02% - 1.02%
+Pisces4.36% 34.80%36.00%
+Training
+Plaintext 6.69% 36.24% 39.21%
+DP-RAG (Grislain, 2025) 4.00% - 4.00%
+RemoteRAG (Cheng et al., 2024) 6.48% - 6.48%
+(Yao & Li, 2025) 0.83% - 0.83%
+Pisces6.01% 34.42%37.74%
+19
+
+===== PAGE 20 =====
+Published as a conference paper at ICLR 2026
+Table 9: Top-10 retrieval accuracy comparison betweenPiscesand baselines over ground-truth.
+Results for DP-RAG (Grislain, 2025) usesε=1, RemoteRAG (Cheng et al., 2024) usesε=1280,
+and (Yao & Li, 2025) usesσ=0.1.
+Dataset Framework Top-10
+Semantic Lexical Dual-Path
+ClapNQ
+Devanswerable
+Plaintext 42.47% 54.84% 67.30%
+DP-RAG (Grislain, 2025) 36.92% - 36.92%
+RemoteRAG (Cheng et al., 2024) 41.91% - 41.91%
+(Yao & Li, 2025) 20.63% - 20.63%
+Pisces36.56% 54.35%65.43%
+Trainanswerable
+Plaintext 27.69% 43.16% 52.10%
+DP-RAG (Grislain, 2025) 23.79% - 23.79%
+RemoteRAG (Cheng et al., 2024) 26.92% - 26.92%
+(Yao & Li, 2025) 9.04% - 9.04%
+Pisces21.95% 42.96%50.75%
+Trainsingleanswerable
+Plaintext 31.60% 46.92% 56.66%
+DP-RAG (Grislain, 2025) 27.94% - 27.94%
+RemoteRAG (Cheng et al., 2024) 30.33% - 30.33%
+(Yao & Li, 2025) 6.05% - 6.05%
+Pisces27.63% 46.83%55.92%
+SQuAD
+Devv2.0
+Plaintext 40.70% 94.60% 95.70%
+DP-RAG (Grislain, 2025) 34.86% - 34.86%
+RemoteRAG (Cheng et al., 2024) 40.00% - 40.00%
+(Yao & Li, 2025) 19.94% - 19.94%
+Pisces31.80% 94.40%95.50%
+Trainingv2.0
+Plaintext 34.80% 85.10% 89.00%
+DP-RAG (Grislain, 2025) 30.12% - 30.12%
+RemoteRAG (Cheng et al., 2024) 30.12% - 30.12%
+(Yao & Li, 2025) 12.20% - 12.20%
+Pisces22.10% 85.00%88.40%
+HotpotQA
+Devdistractor
+Plaintext 8.55% 52.48% 54.69%
+DP-RAG (Grislain, 2025) 7.45% - 7.45%
+RemoteRAG (Cheng et al., 2024) 8.52% - 8.52%
+(Yao & Li, 2025) 1.84% - 1.84%
+Pisces7.77% 51.91%54.31%
+Devfullwiki
+Plaintext 6.17% 40.18% 41.52%
+DP-RAG (Grislain, 2025) 5.45% - 5.45%
+RemoteRAG (Cheng et al., 2024) 6.08% - 6.08%
+(Yao & Li, 2025) 1.30% - 1.30%
+Pisces5.16% 40.17%41.40%
+Training
+Plaintext 7.62% 42.83% 45.77%
+DP-RAG (Grislain, 2025) 5.50% - 5.50%
+RemoteRAG (Cheng et al., 2024) 7.40% - 7.40%
+(Yao & Li, 2025) 1.22% - 1.22%
+Pisces6.84% 40.66%43.83%
+20

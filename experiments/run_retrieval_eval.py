@@ -114,6 +114,7 @@ def run_plaintext_pass(data, plain_bert, db_embeddings, bm25_matrix, n_docs, ks,
             db_tokens_onehot=docs_onehot,
             query_multihot=query_multihots[q_idx],
             bert_model=plain_bert,
+            bm25_vocab=data['bm25_vocab'],
             device='cpu',
             top_k=max(ks),
         )
@@ -182,6 +183,7 @@ def run_cipher_pass(data, weight_path, db_embeddings, bm25_matrix, n_docs, ks, n
                 weight_path=weight_path,
                 timeout_sec=240,
                 tokenizer_name='bert-base-uncased',
+                bm25_vocab=data['bm25_vocab'],
             )
             elapsed = time.time() - t0
             print(f"     一条耗时 {elapsed:.1f}s")
