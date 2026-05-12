@@ -43,6 +43,14 @@ SIMHASH_SEED = 42                          # 投影矩阵 W 的固定随机种�
 PRF_ENABLED = True                         # 总开关：False 则退化为 B3 单轮 lex 检索
 PRF_ALPHA = 0.7                            # 原始 query 的权重
 PRF_BETA = 0.3                             # 反馈 doc 词频的权重
+
+# Sem 路 PRF / 多轮检索（对应 task #5 / ReAct 多轮简化版）
+# 第一轮 sem 检索 → 取 sem top-1 doc 的 embedding → q_expanded_emb = α·query_emb + β·doc_emb
+#                → 第二轮 sem 检索 (用 q_expanded_emb)
+# 概念上对应 ReAct 中"Thought 1 → Act → Thought 2"的两步推理
+SEM_PRF_ENABLED = False                    # 默认关，跟现状兼容；论文 ablation 用
+SEM_PRF_ALPHA = 0.7                        # 原始 query embedding 权重
+SEM_PRF_BETA = 0.3                         # 反馈 doc embedding 权重
 # 反馈源选择 ⭐ 跨路反馈是这个项目的实际创新点
 #   'lex': 同路反馈（用第一轮 lex top-1 doc 反馈到 lex 路） - 经典 PRF
 #   'sem': 跨路反馈（用 sem top-1 doc 反馈到 lex 路） - 跨模态扩展，引入"语义相关但词汇不同"的词
@@ -54,6 +62,17 @@ GEN_NUM = int(os.getenv("NSSMPC_GEN_NUM", "10"))
 
 # 调试开关
 DEBUG = False
+
+# Pre-generation Reranker 配置（架构正确性升级：把 reranker 从 generation 之后移到之前）
+# False (默认): 沿用现状 — 双路各取 top-1 直接喂 joint inference，post-encoding 重排
+# True : 双路各取 top-K1=RERANK_K1 候选 → fusion rerank (bi-encoder + lex score) → top-K2 → joint inference
+#        架构与标准 RAG (first-stage retrieval → cross-encoder rerank → generation) 一致
+# 注意：开启时建议关闭 PRF（互斥的多阶段策略）。代码会强制忽略 PRF。
+RERANK_PRE_GEN_ENABLED = False
+RERANK_K1 = 2                              # 双路各取 K1 个候选 (合并后候选池 = 2*K1)
+RERANK_K2 = 2                              # 融合后保留 K2 个 doc 喂 joint inference
+RERANK_ALPHA = 0.5                         # 融合权重：bi-encoder score (query_emb · cand_emb)
+RERANK_BETA = 0.5                          # 融合权重：cand 对应的 lex score (BM25)
 
 # Lex 路在线密态 BM25 配置（Pisces ICLR 2026 ∏PrivateBM25 / Protocol 2 同型）
 # False: 离线明文算好 bm25_matrix [V, N]，在线只做 indicator @ bm25 (当前默认)

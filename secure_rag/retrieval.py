@@ -275,6 +275,32 @@ def secure_prf_expand_query(
 # SimHash 粗筛 + 密态 cosine 精排（Pisces ICLR 2026 ∏PrivateSS / Protocol 1 同型）
 # ============================================================================
 
+def secure_sem_prf_expand_query(
+    query_emb_share,
+    feedback_doc_emb_share,
+    alpha: float = 0.7,
+    beta: float = 0.3,
+):
+    """
+    [Sem 路 PRF] 用反馈 doc embedding 扩展 query embedding（与 lex 路 secure_prf_expand_query 对称）。
+
+    流程：q_expanded_emb = alpha * query_emb + beta * feedback_doc_emb
+
+    用于"Sem 路两轮检索 / Pisces 同型 + ReAct-style 多轮"：第一轮 sem top-1 doc 反馈到 query embedding 后
+    再走一次 SimHash 粗筛 + cosine 精排，等于 ReAct 中"Thought 1 → Act 1 (retrieve) → Thought 2"两步推理。
+
+    Args:
+        query_emb_share:        ASS [1, hidden]
+        feedback_doc_emb_share: ASS [1, hidden]   反馈源 doc 的语义 embedding
+        alpha:                  float             原始 query embedding 权重 (公开)
+        beta:                   float             反馈 doc embedding 权重 (公开)
+
+    Returns:
+        ASS [1, hidden] 扩展后的 query embedding
+    """
+    return alpha * query_emb_share + beta * feedback_doc_emb_share
+
+
 def get_simhash_projection(hidden_size: int, num_bits: int, seed: int = 42, device=None) -> torch.Tensor:
     """
     生成 SimHash 投影矩阵 W ∈ R^{num_bits × hidden_size}。
@@ -526,6 +552,66 @@ def secure_reader_span(
     span_token_oh_share = expanded * joint_ids_share                      # ASS [1, L, V]
 
     return answer_token_oh, start_logits, end_logits, span_mask, span_token_oh_share
+
+
+# ============================================================================
+# Pre-generation Fusion Reranker（架构正确性升级：reranker 从 generation 之后移到之前）
+# ============================================================================
+
+def secure_fusion_rerank_pregen(
+    query_emb_share,
+    sem_top_k_ind_share,
+    lex_top_k_ind_share,
+    db_embs_share,
+    lex_scores_share,
+    alpha: float = 0.5,
+    beta: float = 0.5,
+    top_k2: int = 2,
+):
+    """
+    [Pre-generation Reranker] 双路融合重排 — 把 reranker 从 generation 之后移到之前。
+
+    架构语义：first-stage retrieval (双路 K1) → rerank (融合) → generation (joint inference)
+        - 候选池 = sem_top_K1 ∪ lex_top_K1 = [2*K1, N]（允许重复）
+        - bi-encoder score: query_emb · cand_doc_emb
+        - lex score: 候选 doc 在 lex 路的 BM25 分数
+        - rerank score = alpha * bi_score + beta * lex_score （加权融合）
+        - top-K2 indicator [K2, N]
+
+    两个 K 的语义：
+        - K1: 双路 first-stage 各取多少候选（建议 K1=2, 候选池 4 个）
+        - K2: rerank 后保留多少 doc 喂 joint inference（建议 K2=2, 占 sem_doc + lex_doc 段）
+
+    全程 ASS 域，无新 send/recv 同步点。
+
+    Args:
+        query_emb_share:        ASS [1, hidden]
+        sem_top_k_ind_share:    ASS [K1, N]   sem 路 first-stage top-K1 indicator
+        lex_top_k_ind_share:    ASS [K1, N]   lex 路 first-stage top-K1 indicator
+        db_embs_share:          ASS [N, hidden]
+        lex_scores_share:       ASS [N]       lex 路全 N 维 BM25 分数 (用于融合)
+        alpha:                  float         bi-encoder 权重
+        beta:                   float         lex 权重
+        top_k2:                 int           最终 top-K2
+
+    Returns:
+        ASS [K2, N]  最终 top-K2 indicator (在全 N 维 doc 上)
+    """
+    # 1. 候选池合并 [2*K1, N]
+    cand_ind = ArithmeticSecretSharing.cat([sem_top_k_ind_share, lex_top_k_ind_share], dim=0)
+    # 2. 候选 doc embedding [2*K1, hidden] = [2*K1, N] @ [N, hidden]
+    cand_embs = cand_ind @ db_embs_share
+    # 3. bi-encoder score: query_emb [1, hidden] · cand_embs [2*K1, hidden] → sum(-1) → [2*K1]
+    bi_scores = (query_emb_share * cand_embs).sum(dim=-1)                  # ASS [2*K1]
+    # 4. 候选对应的 lex score: cand_ind [2*K1, N] * lex_scores [N] → sum(-1) → [2*K1]
+    cand_lex_scores = (cand_ind * lex_scores_share.view(1, -1)).sum(dim=-1)  # ASS [2*K1]
+    # 5. fusion score
+    rerank_scores = alpha * bi_scores + beta * cand_lex_scores              # ASS [2*K1]
+    # 6. top-K2 over candidates
+    top_k2_on_cand = secure_top_k_indicator(rerank_scores.view(-1), k=top_k2)  # ASS [K2, 2*K1]
+    # 7. 投回全 N 维: [K2, 2*K1] @ [2*K1, N] = [K2, N]
+    top_k2_on_N = top_k2_on_cand @ cand_ind                                  # ASS [K2, N]
+    return top_k2_on_N
 
 
 def load_qa_head(qa_head_path: str):

@@ -1,6 +1,8 @@
 # ADSMPC-python · 加密 RAG 系统
 
-> 基于 [NssMPClib](https://github.com/XidianNSS/NssMPClib)（西电 NSS 实验室）2PC 半诚实多方安全计算框架，实现的端到端加密 RAG 原型：**双路检索 → 密态 Top-K → 联合 BERT 推理 → 密态 Cross-Encoder Reranker → 密态抽取式 Reader**，并配套**密态 vs 明文**数值一致性 + 检索质量 + 答案抽取实验对比。
+> 基于 [NssMPClib](https://github.com/XidianNSS/NssMPClib)（西电 NSS 实验室）2PC 半诚实多方安全计算框架，实现的端到端加密 RAG 原型。架构对齐 [Pisces (ICLR 2026)](https://github.com/liang-xiaojian/Pisces) 的双路检索框架，在 reranker / PRF / span reader 三个组件上做正交补充：
+>
+> **Sem 路 SimHash 粗筛 + 密态 cosine 精排  →  Lex 路在线密态 BM25  →  密态 Top-K  →  联合 BERT 推理  →  密态 Cross-Encoder Reranker  →  密态 SQuAD-style Span Reader**
 
 ---
 
@@ -11,77 +13,139 @@
                 │                                                              │
    Client ─────►│  ┌──────────┐    ┌────────────────┐    ┌──────────────────┐   │
    (持有 query) │  │ tokenize │───►│ 密态 query     │───►│ 密态 BERT 编码   │   │
-                │  └──────────┘    │ + 多热向量切分 │    └──────────────────┘   │
-                │                  └────────────────┘             │            │
-                │                                                  ▼            │
+                │  └──────────┘    │ + 多热向量切分 │    │ (SecBertModel)   │   │
+                │                  └────────────────┘    └──────────────────┘   │
+                │                                                  │            │
                 │  Server (持有文档库)         ┌────────────────────────────┐    │
-                │  ┌──────────────────────┐    │ 双路打分                   │   │
-                │  │ db_embeddings [N,h]  │───►│ ├ 语义路: query·doc 内积  │   │
-                │  │ bm25_matrix [V,N]    │───►│ └ 词汇路: BM25 简化打分   │   │
-                │  │ db_tokens_oh [N,L,V] │    └────────────┬───────────────┘   │
-                │  └──────────────────────┘                 ▼                  │
+                │  ┌──────────────────────┐    │ ⭐ Sem 路双阶段 (Pisces  │    │
+                │  │ db_embeddings [N,h]  │───►│   ∏PrivateSS 同型)        │    │
+                │  │ doc_hashes [N,L]     │───►│ ┌ SimHash 粗筛           │    │
+                │  │ tf/idf/doc_norm 或   │    │ │  密态 Hamming → top-M │    │
+                │  │   bm25_matrix        │───►│ └ 密态 cosine 精排       │    │
+                │  │ db_tokens_oh         │    │                            │    │
+                │  └──────────────────────┘    │ ⭐ Lex 路 BM25 双模式    │    │
+                │                              │ ├ Offline: bm25_matrix    │    │
+                │                              │ └ Online: tf/idf/doc_norm │    │
+                │                              │    + secure_div (Pisces   │    │
+                │                              │     ∏PrivateBM25 同型)   │    │
+                │                              └────────────┬───────────────┘    │
+                │                                            ▼                  │
                 │                            ┌────────────────────────────┐    │
-                │                            │ [可选] 密态 PRF 扩展 query │    │
-                │                            │ feedback_source ∈          │    │
-                │                            │   {sem, lex, both}         │    │
-                │                            │ 全程 ASS 域，无新 send/recv│    │
+                │                            │ [可选] 多轮检索:           │    │
+                │                            │  • Lex PRF (跨路反馈)      │    │
+                │                            │  • Sem PRF (ReAct 简化)    │    │
                 │                            └────────────┬───────────────┘    │
-                │                                          ▼                  │
+                │                                            ▼                  │
                 │                            ┌────────────────────────────┐    │
-                │                            │ 密态 Top-K 指示器排序     │    │
-                │                            │ (冒泡 + indicator swap)    │    │
+                │                            │ 密态 Top-K (冒泡+indicator)│    │
+                │                            │ [可选] Pre-gen Reranker:  │    │
+                │                            │  fusion(bi-enc + lex score)│    │
                 │                            └────────────┬───────────────┘    │
-                │                                          ▼                  │
-                │                            ┌────────────────────────────┐    │
-                │                            │ 通过指示器抽取真实 token  │    │
-                │                            │ (sum(ind ⊗ db_tokens))     │    │
-                │                            └────────────┬───────────────┘    │
-                │                                          ▼                  │
-                │                          [Q | doc_sem | doc_lex] (Seq=56)  │
-                │                                          │                  │
-                │                                          ▼                  │
+                │                                            ▼                  │
+                │                          [Q | doc_sem | doc_lex] (Seq=56)    │
+                │                                            │                  │
+                │                                            ▼                  │
                 │                            ┌────────────────────────────┐    │
                 │                            │ 联合密态 BERT 推理         │    │
                 │                            └────────┬───────────────────┘    │
-                │                                seq_out, pool                 │
-                │                                     │                        │
+                │                                seq_out, pool                  │
+                │                                     │                          │
                 │              ┌──────────────────────┼──────────────────────┐ │
                 │              ▼                      ▼                      ▼ │
-                │  ┌──────────────────┐  ┌────────────────────┐  ┌──────────┐  │
-                │  │ 密态 Reranker    │  │ 密态抽取式 Reader  │  │ pool     │  │
-                │  │ pool @ db_embs.T │  │ pool · seq_out →   │  │ 诊断输出 │  │
-                │  │ → rerank_scores  │  │ argmax → gather    │  └──────────┘  │
-                │  └────────┬─────────┘  │ → answer_token_oh  │                │
-                │           │            └─────────┬──────────┘                │
-                │           │                      │                            │
-                │           ▼                      ▼                            │
-                │  ┌──────────────────────────────────────────┐                 │
-                │  │ ⭐ 严格输出方向：三个 share 全部 send 给  │                 │
-                │  │ Client，仅在 Client 端 restore           │                 │
-                │  │ Server 不学习任何 query 相关信息          │                 │
-                │  └──────────────────────────────────────────┘                 │
+                │  ┌──────────────────┐  ┌────────────────────────┐  ┌─────┐  │
+                │  │ Post Reranker    │  │ ⭐ SQuAD Span Reader   │  │ pool │  │
+                │  │ pool @ db_embs.T │  │  start/end heads       │  │ 诊断 │  │
+                │  │ → rerank_scores  │  │  cumsum span_mask      │  └─────┘  │
+                │  └────────┬─────────┘  │  [1,L,V] send 保序     │           │
+                │           │            └─────────┬──────────────┘           │
+                │           ▼                      ▼                          │
+                │  ┌──────────────────────────────────────────┐               │
+                │  │ ⭐ 严格输出方向：所有 share 都 send 给    │              │
+                │  │ Client，仅在 Client 端 restore           │              │
+                │  │ Server 不学习任何 query 相关信息          │              │
+                │  └──────────────────────────────────────────┘               │
                 │                                                              │
                 └──────────────────────────────────────────────────────────────┘
 ```
 
 详细架构、威胁模型、实验设计见：
-- [docs/architecture.md](docs/architecture.md)
-- [docs/threat_model.md](docs/threat_model.md)
+- [docs/architecture.md](docs/architecture.md) — 含 Pisces 协议对齐章节 + 升级版数据流图
+- [docs/threat_model.md](docs/threat_model.md) — 含 Pisces 协议层威胁模型对比
 - [docs/experiments.md](docs/experiments.md)
+- ⭐ [experiments/results/ablation_summary.md](experiments/results/ablation_summary.md) — 6 个 task 消融汇总，论文 ch4 主素材
+- [experiments/results/simhash_ablation.md](experiments/results/simhash_ablation.md) — Sem 路 SimHash 粗筛 (task #1)
+- [experiments/results/rerank_pregen_ablation.md](experiments/results/rerank_pregen_ablation.md) — Pre-gen Reranker 架构正确性 (task #2)
+- [experiments/results/span_reader_ablation.md](experiments/results/span_reader_ablation.md) — Span Reader vs 启发式 reader (task #3)
+- [experiments/results/bm25_online_ablation.md](experiments/results/bm25_online_ablation.md) — Lex 路 BM25 双模式 (task #4)
+- [experiments/results/sem_prf_react_ablation.md](experiments/results/sem_prf_react_ablation.md) — Sem 路 PRF / ReAct 简化 (task #5)
 
 ---
 
 ## 关键设计 / 创新点
 
-| # | 阶段 | 内容 |
+| # | 阶段 | 内容 | 默认 |
+|---|---|---|---|
+| 1 | **Sem 路 SimHash 粗筛** ⭐ task#1 | Pisces ICLR 2026 ∏PrivateSS 同型：公开投影 W → 密态 Hamming 粗筛 → 候选集 → 密态 cosine 精排 | ON |
+| 2 | **Lex 路 BM25 双模式** ⭐ task#4 | offline: 离线 bm25_matrix；online: tf/idf/doc_norm 三分量 + secure_div（Pisces ∏PrivateBM25 同型）| offline |
+| 3 | 密态 Top-K | O(N·K) 冒泡 + indicator swap | - |
+| 4 | 联合密态 BERT | [query, doc_a, doc_b] 串接 56-token 联合推理 | - |
+| 5 | **Pre-generation Reranker** ⭐ task#2 | 双路 K1=2 候选 → fusion rerank (bi-encoder + lex score) → top-K2 → joint inference；架构同标准 RAG | OFF |
+| 6 | Post Reranker (diagnostic) | `pool @ db_embs.T`，rescoring 风格诊断输出 | ON |
+| 7 | **密态 Span Reader** ⭐ task#3 | SQuAD-style start/end heads (mrm8488/bert-tiny-finetuned-squadv2 的 qa_outputs)；cumsum-trick 算 span_mask；[1,L,V] send 保留位置顺序 | ON |
+| 8 | 严格输出方向 (B3) | rerank / pool / answer / span 所有 share 都 send 给 client，server 不学习 | ON |
+| 9 | 密态 Lex PRF | 第一轮 lex top-1 → 反馈到 BM25 词表 → 加权扩展 query → 第二轮 lex | ON (PRF_FEEDBACK_SOURCE='sem') |
+| 10 | **Sem 路 PRF / ReAct 两轮** ⭐ task#5 | 第一轮 sem top-1 → 反馈 doc embedding → q_expanded = α·q + β·d → 第二轮 sem（ReAct Thought1→Act1→Thought2 简化版）| OFF |
+
+### 与 Pisces (ICLR 2026) 对比
+
+| 维度 | Pisces ∏PrivateSS / ∏PrivateBM25 | 本工作 |
 |---|---|---|
-| 1 | 双路初次检索 | 语义路（密态内积）+ 词汇路（密态 BM25 简化打分），两路并行 |
-| 2 | 密态 Top-K | O(N·K) 冒泡 + indicator swap，交换的是身份证向量而非 doc 本体 |
-| 3 | 联合密态 BERT | [query, sem_doc, lex_doc] 串接成 56-token 序列做联合推理 |
-| 4 | **密态 Cross-Encoder Reranker** | `pool @ db_embs.T` 密态 ASS@ASS matmul，把"装饰性"联合推理变成可解释精排 |
-| 5 | **密态抽取式 Reader** | 启发式 head `(pool · seq_out).argmax`，密态 gather token 出来；query 段 + special token (PAD/CLS/SEP) mask 让答案落在文档实词上 |
-| 6 | **严格输出方向（B3）** | rerank / pool / answer **三个 share 全部 send 给 client**，仅 client 端 restore；server 全程不学习客户端 query / 检索结果 / 答案 |
-| 7 | **密态 PRF 实验**（实验中）| 第一轮 lex 检索 → 反馈源 doc 投影到 BM25 词表 → 加权扩展 query → 第二轮 lex 检索；全程 ASS 域无新 send/recv 同步点 |
+| Sem 路粗筛 | SimHash → Oblivious filter (OPRF/OKVS) | SimHash → ASS Hamming + bubble top-M |
+| Sem 路精排 | 密态 cosine | 密态内积（cosine 等价） |
+| Lex 路 tf 获取 | Multi-instance labeled PSI | ASS query indicator @ tf 矩阵 (online) |
+| Lex 路 BM25 公式 | 在线密态 (MPC-based) | **在线密态 (LEX_BM25_ONLINE=True)** ⭐ |
+| Top-K | Secure sorting (bitonic) | Bubble + indicator swap |
+| **Cross-encoder Reranker** | ❌ 无 | ✅ pool @ db_embs.T (post) 或 fusion (pre) |
+| **PRF / 多轮** | ❌ 无 | ✅ Lex PRF + Sem PRF (ReAct 风格) |
+| **生成阶段** | 委托外部密态 LLM (声明) | 委托接口 + **可跑的 default SQuAD span reader** |
+
+**叙事**：检索协议层与 Pisces 同型，Reranker / PRF / Span Reader 三个组件为正交补充。
+
+---
+
+## 配置开关（`secure_rag/config.py`）
+
+5 个开关控制整个 pipeline 行为，便于论文 ablation：
+
+```python
+# Sem 路 SimHash 粗筛 (task #1) ⭐ 默认 ON
+SIMHASH_ENABLED        = True       # OFF 时退化为全 N 直接密态内积
+SIMHASH_BITS           = 128        # L=64 在 N=10 损失 1 hit；L=128 完全无损
+SIMHASH_CANDIDATES_M   = 5          # 粗筛后候选集大小 (建议 N//2)
+
+# Lex 路在线密态 BM25 (task #4) ⭐ 默认 OFF（Pisces 同型协议）
+LEX_BM25_ONLINE        = False      # True 切到 tf/idf/doc_norm + secure_div
+LEX_BM25_K1, LEX_BM25_B = 1.5, 0.75 # BM25 公开参数
+
+# Pre-generation Reranker (task #2) ⭐ 默认 OFF
+RERANK_PRE_GEN_ENABLED = False      # True: 双路 K1=2 → fusion rerank → top-K2 → joint
+RERANK_K1, RERANK_K2   = 2, 2
+RERANK_ALPHA, RERANK_BETA = 0.5, 0.5  # bi-encoder 权重 / lex score 权重
+
+# Span Reader (task #3) ⭐ 默认 ON
+SPAN_READER_ENABLED    = True       # OFF 退化到旧启发式 (pool · seq_out).argmax
+
+# Sem 路 PRF / ReAct 两轮 (task #5) ⭐ 默认 OFF
+SEM_PRF_ENABLED        = False      # True 启用 sem 两轮（与 lex PRF 对称）
+SEM_PRF_ALPHA, SEM_PRF_BETA = 0.7, 0.3
+
+# Lex 路 PRF (已有，默认 ON)
+PRF_ENABLED            = True
+PRF_FEEDBACK_SOURCE    = 'sem'      # 'sem' (跨路) / 'lex' (同路) / 'both'
+PRF_ALPHA, PRF_BETA    = 0.7, 0.3
+```
+
+**默认组合**（推荐答辩配置）：SimHash ON + Span Reader ON + Lex PRF ON，其他 OFF。端到端 ~78s/query，Pool cos 0.93+，密态 reader 输出有意义的 doc 子串。
 
 ---
 
@@ -95,11 +159,21 @@ ADSMPC-python/
 │
 ├── secure_rag/                         ← 加密 RAG 应用层（本项目核心）
 │   ├── __init__.py
-│   ├── config.py                       ← BERT/RAG/PRF 超参与开关
-│   ├── retrieval.py                    ← 双路打分 + Top-K + Reranker + Reader + PRF
+│   ├── config.py                       ← 5 个开关 + BERT/RAG 超参
+│   ├── retrieval.py                    ← 10 个 secure_* 协议函数
+│   │   ├ 双路打分: secure_inner_product_score / secure_lexical_score
+│   │   ├ Top-K:    secure_top_k_indicator
+│   │   ├ SimHash:  get_simhash_projection / plaintext_simhash_bits /
+│   │   │           secure_simhash_query / secure_simhash_coarse_filter /
+│   │   │           secure_simhash_coarse_to_fine
+│   │   ├ BM25:     secure_bm25_online_score
+│   │   ├ Reranker: secure_rerank (post) / secure_fusion_rerank_pregen (pre)
+│   │   ├ Reader:   secure_reader (启发式) / secure_reader_span (SQuAD)
+│   │   │           load_qa_head
+│   │   └ PRF:      secure_prf_expand_query (lex) / secure_sem_prf_expand_query (sem)
 │   ├── server.py                       ← Server 角色（party_id=0）
 │   ├── client.py                       ← Client 角色（party_id=1）
-│   ├── plaintext.py                    ← 明文 RAG（实验对照）
+│   ├── plaintext.py                    ← 明文 RAG（实验对照，含 build_bm25_components）
 │   └── params.py                       ← 一次性生成全部辅助参数
 │
 ├── experiments/                        ← 实验脚本与数据
@@ -112,33 +186,38 @@ ADSMPC-python/
 │   ├── run_numerical_compare.py        ← 任务 A：单 query 数值一致性 + 答案对比
 │   ├── run_retrieval_eval.py           ← 任务 B：N 条 query 检索质量 + EM/PM/F1
 │   ├── run_main.py                     ← 整合入口
-│   └── results/                        ← 实验输出（自动写）
+│   └── results/                        ← 实验输出（含 6 个 ablation md）
 │
 ├── docs/                               ← 项目文档
-│   ├── architecture.md
-│   ├── threat_model.md
+│   ├── architecture.md                 ← 系统架构 + Pisces 对齐
+│   ├── threat_model.md                 ← 威胁模型 + Pisces 协议层对比
 │   └── experiments.md
+│
+├── doc/                                ← 关键参考论文
+│   ├── 17937_Pisces_Cryptography_base.pdf       ← Pisces (ICLR 2026)
+│   └── 5016_react_synergizing_reasoning_an.pdf  ← ReAct (ICLR 2023)
 │
 ├── 毕业论文/                           ← 论文相关
 │   ├── 支持隐私保护的电子图书系统-论文.docx
-│   ├── generate_thesis_full.py         ← 重新生成 docx 的脚本
 │   └── thesis_full.md / thesis_part*.md
 │
 ├── models/                             ← 预训练权重
-│   └── bert_tiny_weights.pth           ← prajjwal1/bert-tiny (17 MB)
+│   ├── bert_tiny_weights.pth           ← prajjwal1/bert-tiny (17 MB)
+│   └── qa_head_squadv2.pth             ← SQuAD QA head (task #3 用)
 │
-├── scripts/                            ← 编译脚本（torchcsprng 等）
-│   ├── build_csprng_cpu.bat
-│   └── dump_deps.bat
+├── scripts/                            ← 工具脚本
+│   ├── build_csprng_cpu.bat            ← 编译 torchcsprng
+│   ├── dump_deps.bat
+│   └── extract_squad_qa_head.py        ← 从 HF 提取 SQuAD QA head 权重
 │
-├── NssMPClib/                          ← 底层 MPC 库（本项目修过几个 bug，详见 SESSION_HANDOFF.md）
+├── NssMPClib/                          ← 底层 MPC 库
 │   ├── NssMPC/                         ← 库源码
 │   ├── csprng/                         ← AES PRG 编译扩展
 │   ├── tutorials/                      ← 库教程 notebook
 │   ├── data/                           ← CNN/AlexNet 等模型骨架
-│   └── test/                           ← 旧入口 rag.py / test_mha.py（兼容保留）
+│   └── test/                           ← 旧入口 rag.py（兼容保留）
 │
-└── test/                               ← 顶层 demo（CNN MNIST 推理）
+└── test/                               ← 顶层 demo
     └── inference_test.ipynb
 ```
 
@@ -176,15 +255,16 @@ cd NssMPClib/csprng && pip install -e . && cd ../..
 
 ## 快速启动
 
-### 标准实验（毕设答辩）
+### 标准实验（毕设答辩，默认配置）
 
 ```bash
 # 必设 env
 export DEVICE=cpu
 export NSSMPC_GEN_NUM=10
 
+# 默认配置: SimHash L=128 + Span Reader + Lex PRF + 其他 OFF
 # 任务 A 单条 query 数值一致性 + Reader 答案对比（约 80 秒）
-python -m experiments.run_numerical_compare --query_idx 0
+python -m experiments.run_numerical_compare --query_idx 4
 
 # 任务 B 多条 query 检索 + EM/PM/F1 评估（10 条约 13 分钟）
 python -m experiments.run_retrieval_eval --num_queries 10 --num_docs 10
@@ -199,13 +279,33 @@ python -m experiments.run_retrieval_eval --num_queries 50
 python -m experiments.run_retrieval_eval --num_queries 50 --skip_cipher
 ```
 
-### PRF 开关（在 `secure_rag/config.py`）
+### SQuAD QA head 提取（首次运行 Span Reader 前）
+
+```bash
+# 从 HuggingFace 拉 mrm8488/bert-tiny-finetuned-squadv2，提取 qa_outputs 权重
+python scripts/extract_squad_qa_head.py
+# → 产物保存到 models/qa_head_squadv2.pth (~28 KB)
+```
+
+### 开 Pisces 同型协议 / 多轮 / 架构正确性 ablation
+
+直接改 `secure_rag/config.py` 中对应开关即可，所有 ablation 都不需要改其他代码：
 
 ```python
-PRF_ENABLED = True                     # False = 退化为单轮检索（B3 行为）
-PRF_ALPHA = 0.7                        # 原始 query 权重
-PRF_BETA = 0.3                         # 反馈 doc 权重
-PRF_FEEDBACK_SOURCE = 'sem'            # 'sem' (跨路) / 'lex' (同路) / 'both' (聚合)
+# 实验 1: 启用 Pisces ∏PrivateBM25 同型协议
+LEX_BM25_ONLINE = True
+
+# 实验 2: 启用 Sem 路两轮检索 (ReAct Thought→Act→Thought 简化版)
+SEM_PRF_ENABLED = True
+
+# 实验 3: 启用 Pre-generation Reranker (标准 RAG 拓扑)
+RERANK_PRE_GEN_ENABLED = True   # 注意：与 PRF 互斥，会强制关闭 PRF
+
+# 实验 4: 关闭 SimHash 粗筛 (退化到全 N 直接密态内积)
+SIMHASH_ENABLED = False
+
+# 实验 5: 关闭 Span Reader (退化到旧启发式 reader)
+SPAN_READER_ENABLED = False
 ```
 
 ### 旧入口（兼容保留）
@@ -218,14 +318,56 @@ DEVICE=cpu NSSMPC_GEN_NUM=10 python NssMPClib/test/rag.py
 
 ## 实验结果
 
-### 数值一致性（Query #0：`What is the capital of France?`）
+### 6 个 Task 实证收益总览
 
-| 指标 | 数值 | 含义 |
+| Task | 创新点 | 默认 | Q#4 实证收益 (vs 旧版 baseline) |
+|---|---|---|---|
+| #1 SimHash 粗筛 | Sem 路 Pisces ∏PrivateSS 同型 | ON | 端到端 **-8%** (84.5→77.6s)；sem top-1 在 N=10 上完全无损 |
+| #2 Pre-gen Reranker | 架构正确性 (post→pre rerank) | OFF | 协议价值 (标准 RAG 拓扑)；密态 noise 让 reader 退化为 [PAD] |
+| #3 Span Reader | 启发式→SQuAD start/end heads | ON | 明文 **PM 0.10→0.30 (+200%)**；F1 0→0.04；密态输出 'the longest river in africa' |
+| #4 BM25 Online | Lex 路 Pisces ∏PrivateBM25 同型 | OFF | 协议层 Pisces 对齐；+1% 耗时 (batched secure_div 极快) |
+| #5 Sem PRF / ReAct | 两轮 sem 检索 (ReAct 简化) | OFF | 与 lex PRF 对称，+4s/query；单跳问答上无额外收益 |
+| #6 Pisces baseline + 消融 | 论文 ch4 章节素材 | - | 6 个 ablation 报告 + Pisces 对比表 + 升级版 architecture/threat_model |
+
+---### 数值一致性（Query #4：`Which is the longest river in Africa?`）
+
+| 配置 | 端到端耗时 | Pool cosine_sim | Rerank cosine_sim | 加密延迟代价 |
+|---|---|---|---|---|
+| 旧版 (无 SimHash + 启发式 reader) | ~84.5 s | 0.949 | 0.9998 | ×2042 |
+| **+SimHash L=128 (Pisces ∏PrivateSS 同型)** | 77.6 s | 0.877 | 0.9995 | ×1844 |
+| **+SimHash + Span Reader (SQuAD head)** | ~82.0 s | 0.935 | 0.9997 | ×1709 |
+| **+SimHash + Span + BM25 Online (Pisces ∏PrivateBM25 同型)** | 78.9 s | 0.936 | 0.9998 | ×2322 |
+
+### Reader 答案抽取（明文 10-query）
+
+| 配置 | EM (严格) | Partial Match | Token F1 | 改进 |
+|---|---|---|---|---|
+| 旧版 启发式 reader (`pool · seq_out`) | 0.00 | **0.10** | 0.000 | baseline |
+| **新版 SQuAD Span Reader (start/end heads)** | 0.00 | **0.30** ⭐ | **0.040** ⭐ | PM +200% |
+
+**关键例子**（Q#4 'longest river in Africa', gt='nile'）：
+- 旧 reader 输出：`is`（无关词）
+- **新明文 reader**：`the nile is the longest river in africa flowing` ✓ 含 'nile'
+- **新密态 reader**：`the longest river in africa` ✓ 是 doc 4 的真子串
+
+### Sem 路 SimHash 检索精度（明文 10-query, N=10, gt 在前 10 doc 内）
+
+| 配置 | sem top-1 hit | 与 Full cosine 一致率 |
 |---|---|---|
-| Pool cosine_sim | **0.949** | 联合推理 [CLS] pooler 输出，定点数误差累积 |
-| **Rerank cosine_sim** | **0.9998** ⭐ | 128 维内积求和把误差平均掉 — 论文亮点 |
-| 单 query 端到端耗时 | **80-84 秒** | CPU + torchcsprng |
-| 加密延迟代价 | ×1830-2040 | vs 明文 ~0.04 秒 |
+| Full cosine (无 SimHash baseline) | 4/10 = 0.40 | 1.00 |
+| SimHash L=64, M=5 | 3/10 = 0.30 | 0.90 |
+| **SimHash L=128, M=5 (默认)** | **4/10 = 0.40** | **1.00** ⭐ |
+
+L=128 在 N=10 上 sem top-1 完全无损；L=64 损失 1/10。
+
+### Lex 路 BM25 双模式（Q#4 实测）
+
+| 模式 | 端到端耗时 | Pool cos | Rerank cos | 协议层 |
+|---|---|---|---|---|
+| Offline (默认): 离线 bm25_matrix | 78.0 s | 0.9353 | 0.9997 | 简单 |
+| **Online: tf+idf+doc_norm + secure_div** | **78.9 s (+1%)** | **0.9356** | 0.9998 | Pisces ∏PrivateBM25 同型 |
+
+**结论**：online 模式增加开销可忽略（NssMPClib batched secure_div 极快），但协议层叙事跟 Pisces 一致。
 
 ### 检索质量（10 query × 10 doc，无 PRF / B3 baseline）
 
@@ -239,17 +381,7 @@ DEVICE=cpu NSSMPC_GEN_NUM=10 python NssMPClib/test/rag.py
 
 ⭐ **密态指标普遍略优于明文**：定点数 LayerNorm/Softmax 查表近似的"小幅平滑"等价于隐式正则化。
 
-### Reader 答案抽取
-
-| 指标 | 明文 | 密态 |
-|---|---|---|
-| EM (严格) | 0.00 | 0.00 |
-| Partial Match | 0.10 | 0.00 |
-| Token F1 | 0.00 | 0.00 |
-
-启发式 head（`pool · seq_out`）倾向于选通用词（is/city/asia/chambers），匹配不到专有名词答案（paris/beijing/tokyo）。Special token mask 起作用 — 不再选 [CLS]/[SEP]/[PAD]。提升空间在换 SQuAD 微调 head（未来工作）。
-
-### PRF 消融实验（10 query）
+### PRF 消融实验（10 query，旧版 architecture）
 
 | 配置 | 密态 R@1 | 密态 NDCG@5 | 密态 MRR |
 |---|---|---|---|
@@ -267,10 +399,11 @@ DEVICE=cpu NSSMPC_GEN_NUM=10 python NssMPClib/test/rag.py
 | 查询编码（Stage 3） | ~7 秒 | ~9% |
 | 子进程启动 + 模型分享 | ~5 秒 | ~6% |
 | 文档库分享 | ~1.5 秒 | ~2% |
-| 双路打分 + Top-K + 取文档 | ~2.5 秒 | ~3% |
+| 双路打分 + Top-K + 取文档 (含 SimHash) | ~3 秒 | ~4% |
 | Reranker matmul | ~0.5 秒 | ~0.6% |
 | Reader (含 mask + argmax + gather) | ~1 秒 | ~1.2% |
 | PRF 第二轮 lex（如启用） | +5 秒 | +6% |
+| BM25 Online (如启用) | +1 秒 | +1% |
 
 通信：服务端 ~624 rounds / ~524 MB；客户端 ~389 rounds / ~319 MB。
 
@@ -282,12 +415,12 @@ DEVICE=cpu NSSMPC_GEN_NUM=10 python NssMPClib/test/rag.py
 
 ## 已知限制
 
-1. **Reader 是启发式 head，不是 SQuAD 微调**：bert-tiny 上效果有限，专有名词答案命中率低；论文里建议未来工作换微调 head。
-2. **Top-K 是 O(N·K) 冒泡排序**：N=10 OK，N=1000+ 不实用，需要新的 MPC 友好近似 Top-K 算法。
-3. **BM25 是预算化简化版**：所有非线性（idf 对数 + tf 比值）都被算到离线明文矩阵，密态侧只算稀疏点积；V=100 词表偏小。
-4. **密态 PRF 在 reranker-dominated 架构下失效**：有 insight 但无正向 IR 提升；详见 `experiments/results/retrieval_eval_n10_b3_prf*.md`。
+1. **EM 仍为 0**：bert-tiny SQuAD-finetune head 倾向于选完整子句（如 'the nile is the longest river in africa'）而非单 token 实体（如 'nile'）。EM 显著提升需要换 bert-base 或 fine-tune 短答案。Partial Match 已从 0.10 提升到 0.30。
+2. **Top-K 是 O(N·K) 冒泡排序**：N=10 OK，N=1000+ 不实用，需要新的 MPC 友好近似 Top-K 算法（Pisces 用 secure sorting）。
+3. **协议层未实现真 PSI**：Lex 路 BM25 Online 模式让 server 不再持有"成品 BM25 score"，但 server 仍能从 query indicator share 推断 query 词表分布；要达到 Pisces 那种"server 完全不知 client query 包含哪些 token"，需要 OPRF/OKVS 原语，NssMPClib 当前不支持。
+4. **密态 PRF 在 reranker-dominated 架构下失效**：有 insight 但无正向 IR 提升。
 5. **半诚实假设**：当前协议不防止主动作弊；NssMPClib 内有 VDPF/VSigma 但本项目未启用。
-6. **生成阶段是抽取式**：最终输出是 [V] one-hot 的 token id，不能产出多 token 自然语言段；扩展到 generative LLM 需要密态 sampling。
+6. **生成阶段是抽取式**：最终输出是 [start, end] 区间内的 token id 序列，不能产出多 token 自然语言段；扩展到 generative LLM 需要外接 SIGMA / PUMA / BumbleBee（项目提供"可插拔生成接口"）。
 
 ---
 

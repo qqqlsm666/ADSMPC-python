@@ -43,7 +43,15 @@
       "Bash(rm -rf secure_rag/__pycache__ experiments/__pycache__)",
       "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4_v2.md)",
       "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4_v3.md)",
-      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4_v4.md)"
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_span_q4_v4.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_bm25_offline.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_bm25_online.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_final.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_rerank_off.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_rerank_on.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_sem_prf.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_all_tasks_done.md)",
+      "Bash(awk NR>=48 && NR<=72 *)"
     ]
   }
 }

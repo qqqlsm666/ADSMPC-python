@@ -104,6 +104,13 @@ def main():
     db_embeddings = encode_docs_to_embeddings(docs_token_ids, plain_bert, device='cpu')
     bm25_matrix = build_bm25_matrix(docs_token_ids, bm25_vocab)
 
+    # 仅当 LEX_BM25_ONLINE 时另外算 BM25 三分量 (tf, idf, doc_norm)
+    bm25_components = None
+    if LEX_BM25_ONLINE:
+        print(f"      [LEX_BM25_ONLINE] 计算 BM25 三分量 (tf/idf/doc_norm) for k1={LEX_BM25_K1}, b={LEX_BM25_B}")
+        tf, idf, doc_norm = build_bm25_components(docs_token_ids, bm25_vocab, k1=LEX_BM25_K1, b=LEX_BM25_B)
+        bm25_components = {'tf': tf, 'idf': idf, 'doc_norm': doc_norm}
+
     # ---------- 4. 跑明文 RAG ----------
     print("[4/6] 跑明文 RAG ...")
     t0 = time.time()
@@ -132,6 +139,7 @@ def main():
         weight_path=weight_path,
         tokenizer_name='bert-base-uncased',
         bm25_vocab=bm25_vocab,
+        bm25_components=bm25_components,
     )
     cipher_pool = cipher_out['pool']                                       # [1, hidden]
     cipher_rerank = cipher_out['rerank_scores']                            # [NUM_DOCS]

@@ -27,6 +27,8 @@ from .config import (
     SIMHASH_ENABLED, SIMHASH_BITS, SIMHASH_CANDIDATES_M, SIMHASH_SEED,
     SPAN_READER_ENABLED, default_qa_head_path,
     LEX_BM25_ONLINE, LEX_BM25_K1, LEX_BM25_B,
+    RERANK_PRE_GEN_ENABLED, RERANK_K1, RERANK_K2, RERANK_ALPHA, RERANK_BETA,
+    SEM_PRF_ENABLED, SEM_PRF_ALPHA, SEM_PRF_BETA,
 )
 from .retrieval import (
     secure_inner_product_score,
@@ -39,6 +41,8 @@ from .retrieval import (
     load_qa_head,
     secure_reader_span,
     secure_bm25_online_score,
+    secure_fusion_rerank_pregen,
+    secure_sem_prf_expand_query,
 )
 
 
@@ -198,15 +202,30 @@ def run_server(
         _, query_emb_share = model(sh_in[0], sh_pos[0], sh_type[0], mask)
 
         # ---------- 4. 双路打分 ----------
-        print("[Server] RAG: 开始双路密态打分与召回...")
+        # 当 RERANK_PRE_GEN_ENABLED=True 时双路各取 K1=RERANK_K1 个候选 (比默认 TOP_K=1 多)
+        sem_top_k1 = RERANK_K1 if RERANK_PRE_GEN_ENABLED else TOP_K
+        print(f"[Server] RAG: 开始双路密态打分与召回 (K1={sem_top_k1}{', RERANK_PRE_GEN ON' if RERANK_PRE_GEN_ENABLED else ''})...")
         if SIMHASH_ENABLED:
-            # Pisces-aligned 语义路: SimHash 粗筛 → 密态 cosine 精排 → top-K indicator
-            print(f"[Server] [Sem] SimHash 粗筛 (M={SIMHASH_CANDIDATES_M}) → 密态 cosine 精排 ...")
+            # Pisces-aligned 语义路: SimHash 粗筛 → 密态 cosine 精排 → top-K1 indicator
+            print(f"[Server] [Sem round1] SimHash 粗筛 (M={SIMHASH_CANDIDATES_M}) → 密态 cosine 精排 ...")
             top_k_ind_sem_share_pre = secure_simhash_coarse_to_fine(
                 query_emb_share, my_db_share, my_doc_hashes_share,
-                simhash_proj_ring, SIMHASH_CANDIDATES_M, top_k=TOP_K,
+                simhash_proj_ring, SIMHASH_CANDIDATES_M, top_k=sem_top_k1,
             )
-            scores_sem_share = None  # 已经在 coarse_to_fine 内取了 top-K，不需要全 N 维分数
+            scores_sem_share = None
+            # ⭐ Sem 路 PRF round 2 (ReAct-style 多轮检索简化版)
+            if SEM_PRF_ENABLED and not RERANK_PRE_GEN_ENABLED:
+                # round 1 sem top-1 indicator [1, N]，提取 doc embedding [1, hidden]
+                feedback_doc_emb_share = top_k_ind_sem_share_pre[0:1] @ my_db_share
+                print(f"[Server] [Sem round2] PRF 扩展 query embedding (alpha={SEM_PRF_ALPHA}, beta={SEM_PRF_BETA}) ...")
+                q_expanded_emb_share = secure_sem_prf_expand_query(
+                    query_emb_share, feedback_doc_emb_share, SEM_PRF_ALPHA, SEM_PRF_BETA,
+                )
+                print(f"[Server] [Sem round2] 重新走 SimHash 粗筛 + 密态 cosine 精排 ...")
+                top_k_ind_sem_share_pre = secure_simhash_coarse_to_fine(
+                    q_expanded_emb_share, my_db_share, my_doc_hashes_share,
+                    simhash_proj_ring, SIMHASH_CANDIDATES_M, top_k=sem_top_k1,
+                )
         else:
             scores_sem_share = secure_inner_product_score(query_emb_share, my_db_share)
             top_k_ind_sem_share_pre = None
@@ -228,46 +247,59 @@ def run_server(
 
         print("[融合] sem 路 Top-K + 取文档 ...")
         if SIMHASH_ENABLED:
-            top_k_ind_sem_share = top_k_ind_sem_share_pre
+            top_k_ind_sem_share = top_k_ind_sem_share_pre                              # [K1, N]
         else:
-            top_k_ind_sem_share = secure_top_k_indicator(scores_sem_share, k=TOP_K)
-        expanded_ind_sem = top_k_ind_sem_share.unsqueeze(-1).unsqueeze(-1)
-        my_doc_sem_share = (expanded_ind_sem * my_db_tokens_share).sum(dim=1)
+            top_k_ind_sem_share = secure_top_k_indicator(scores_sem_share, k=sem_top_k1)  # [K1, N]
 
         print("[融合] lex 路 Top-K（第一轮）+ 取反馈 doc ...")
-        top_k_ind_lex_round1_share = secure_top_k_indicator(scores_lex_share, k=TOP_K)
-        expanded_ind_lex_round1 = top_k_ind_lex_round1_share.unsqueeze(-1).unsqueeze(-1)
-        my_doc_lex_round1_share = (expanded_ind_lex_round1 * my_db_tokens_share).sum(dim=1)
+        top_k_ind_lex_round1_share = secure_top_k_indicator(scores_lex_share, k=sem_top_k1)
+        # 注意：在 RERANK_PRE_GEN_ENABLED=True 模式下，sem_top_k1 == RERANK_K1（双路对齐）
 
-        # 密态 PRF 扩展：用反馈源 doc 的 token 频率反过来扩展 query
-        # 全程 ASS 域，无新 send/recv 同步点；server / client 各自做对称运算
-        # 反馈源选择（PRF_FEEDBACK_SOURCE）：
-        #   'sem' 跨路反馈：sem top-1 → lex query，引入语义相关但词汇不同的词 ⭐ 创新点
-        #   'lex' 同路反馈：经典 Rocchio PRF
-        #   'both' 双路聚合
-        if PRF_ENABLED and bm25_vocab is not None:
-            if PRF_FEEDBACK_SOURCE == 'sem':
-                feedback_doc_share = my_doc_sem_share
-            elif PRF_FEEDBACK_SOURCE == 'both':
-                feedback_doc_share = my_doc_sem_share + my_doc_lex_round1_share
-            else:  # 'lex'
-                feedback_doc_share = my_doc_lex_round1_share
-            print(f"[PRF] 反馈源={PRF_FEEDBACK_SOURCE}, 扩展 query (alpha={PRF_ALPHA}, beta={PRF_BETA}) ...")
-            q_expanded_share = secure_prf_expand_query(
-                my_query_multihot_share, feedback_doc_share, bm25_vocab,
-                alpha=PRF_ALPHA, beta=PRF_BETA,
-            )
-            print("[Server] RAG: 词汇路第二轮打分（PRF 扩展 query）...")
-            scores_lex_share_round2 = secure_lexical_score(q_expanded_share, my_bm25_matrix_share) if not LEX_BM25_ONLINE else \
-                secure_bm25_online_score(q_expanded_share, my_tf_share, my_idf_share, my_doc_norm_share, k1=LEX_BM25_K1)
-
-            print("[融合] lex 路 Top-K（第二轮）+ 取最终 doc ...")
-            top_k_ind_lex_share = secure_top_k_indicator(scores_lex_share_round2, k=TOP_K)
-            expanded_ind_lex = top_k_ind_lex_share.unsqueeze(-1).unsqueeze(-1)
-            my_doc_lex_share = (expanded_ind_lex * my_db_tokens_share).sum(dim=1)
+        if RERANK_PRE_GEN_ENABLED:
+            # ⭐ Pre-generation Reranker 模式：双路 K1 候选 → fusion rerank → top-K2 → joint inference
+            # 强制忽略 PRF（多阶段策略互斥）
+            print(f"[Server] [Pre-gen Rerank] 双路融合重排 (alpha={RERANK_ALPHA}, beta={RERANK_BETA}, K1={RERANK_K1}, K2={RERANK_K2}) ...")
+            top_k2_ind_share = secure_fusion_rerank_pregen(
+                query_emb_share, top_k_ind_sem_share, top_k_ind_lex_round1_share,
+                my_db_share, scores_lex_share,
+                alpha=RERANK_ALPHA, beta=RERANK_BETA, top_k2=RERANK_K2,
+            )                                                                            # ASS [K2, N]
+            # 把 top-K2 拆成两个 doc 喂 sem_doc 段和 lex_doc 段（segment id 一致，顺序无关）
+            doc_a_ind = top_k2_ind_share[0:1]                                            # ASS [1, N]
+            doc_b_ind = top_k2_ind_share[1:2] if RERANK_K2 >= 2 else top_k2_ind_share[0:1]
+            my_doc_sem_share = (doc_a_ind.unsqueeze(-1).unsqueeze(-1) * my_db_tokens_share).sum(dim=1)
+            my_doc_lex_share = (doc_b_ind.unsqueeze(-1).unsqueeze(-1) * my_db_tokens_share).sum(dim=1)
         else:
-            # 未开 PRF：退化为 B3 单轮行为
-            my_doc_lex_share = my_doc_lex_round1_share
+            # 默认模式：sem top-1 + lex top-1（含 PRF round 2，如启用）
+            expanded_ind_sem = top_k_ind_sem_share.unsqueeze(-1).unsqueeze(-1)
+            my_doc_sem_share = (expanded_ind_sem * my_db_tokens_share).sum(dim=1)
+
+            expanded_ind_lex_round1 = top_k_ind_lex_round1_share.unsqueeze(-1).unsqueeze(-1)
+            my_doc_lex_round1_share = (expanded_ind_lex_round1 * my_db_tokens_share).sum(dim=1)
+
+            # 密态 PRF 扩展：用反馈源 doc 的 token 频率反过来扩展 query
+            if PRF_ENABLED and bm25_vocab is not None:
+                if PRF_FEEDBACK_SOURCE == 'sem':
+                    feedback_doc_share = my_doc_sem_share
+                elif PRF_FEEDBACK_SOURCE == 'both':
+                    feedback_doc_share = my_doc_sem_share + my_doc_lex_round1_share
+                else:  # 'lex'
+                    feedback_doc_share = my_doc_lex_round1_share
+                print(f"[PRF] 反馈源={PRF_FEEDBACK_SOURCE}, 扩展 query (alpha={PRF_ALPHA}, beta={PRF_BETA}) ...")
+                q_expanded_share = secure_prf_expand_query(
+                    my_query_multihot_share, feedback_doc_share, bm25_vocab,
+                    alpha=PRF_ALPHA, beta=PRF_BETA,
+                )
+                print("[Server] RAG: 词汇路第二轮打分（PRF 扩展 query）...")
+                scores_lex_share_round2 = secure_lexical_score(q_expanded_share, my_bm25_matrix_share) if not LEX_BM25_ONLINE else \
+                    secure_bm25_online_score(q_expanded_share, my_tf_share, my_idf_share, my_doc_norm_share, k1=LEX_BM25_K1)
+
+                print("[融合] lex 路 Top-K（第二轮）+ 取最终 doc ...")
+                top_k_ind_lex_share = secure_top_k_indicator(scores_lex_share_round2, k=TOP_K)
+                expanded_ind_lex = top_k_ind_lex_share.unsqueeze(-1).unsqueeze(-1)
+                my_doc_lex_share = (expanded_ind_lex * my_db_tokens_share).sum(dim=1)
+            else:
+                my_doc_lex_share = my_doc_lex_round1_share
 
         my_query_share = sh_in[0]
         my_joint_ids_share = ArithmeticSecretSharing.cat(
