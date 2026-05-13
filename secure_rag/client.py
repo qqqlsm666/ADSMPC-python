@@ -22,7 +22,8 @@ from NssMPC.application.neural_network.layers.mha import SecBertModel
 from .config import (
     BERT_CONFIG, NUM_DOCS, TOP_K, SEQ, QUERY_LEN, SEM_DOC_LEN, LEX_DOC_LEN,
     VOCAB_SIZE_BM25, TOTAL_SEQ,
-    PRF_ENABLED, PRF_ALPHA, PRF_BETA, PRF_FEEDBACK_SOURCE,
+    PRF_ENABLED, PRF_ALPHA, PRF_BETA, PRF_FEEDBACK_SOURCE, PRF_CANDIDATE_POOL_RERANK,
+    PRF_RERANK_BOOST,
     SIMHASH_ENABLED, SIMHASH_BITS, SIMHASH_CANDIDATES_M, SIMHASH_SEED,
     SPAN_READER_ENABLED, default_qa_head_path,
     LEX_BM25_ONLINE, LEX_BM25_K1, LEX_BM25_B,
@@ -41,6 +42,8 @@ from .retrieval import (
     secure_bm25_online_score,
     secure_fusion_rerank_pregen,
     secure_sem_prf_expand_query,
+    secure_rerank_on_candidates,
+    secure_rerank_hybrid,
 )
 
 
@@ -200,18 +203,17 @@ def run_client(
         top_k_ind_lex_round1_share = secure_top_k_indicator(scores_lex_share, k=sem_top_k1)
 
         if RERANK_PRE_GEN_ENABLED:
-            # ⭐ Pre-generation Reranker 模式：双路 K1 候选 → fusion rerank → top-K2 → joint inference
-            # 强制忽略 PRF（多阶段策略互斥）
             print(f"[Client] [Pre-gen Rerank] 双路融合重排 (alpha={RERANK_ALPHA}, beta={RERANK_BETA}, K1={RERANK_K1}, K2={RERANK_K2}) ...")
             top_k2_ind_share = secure_fusion_rerank_pregen(
                 query_emb_share, top_k_ind_sem_share, top_k_ind_lex_round1_share,
                 my_db_share, scores_lex_share,
                 alpha=RERANK_ALPHA, beta=RERANK_BETA, top_k2=RERANK_K2,
-            )                                                                            # ASS [K2, N]
-            doc_a_ind = top_k2_ind_share[0:1]                                            # [1, N]
+            )
+            doc_a_ind = top_k2_ind_share[0:1]
             doc_b_ind = top_k2_ind_share[1:2] if RERANK_K2 >= 2 else top_k2_ind_share[0:1]
             my_doc_sem_share = (doc_a_ind.unsqueeze(-1).unsqueeze(-1) * my_db_tokens_share).sum(dim=1)
             my_doc_lex_share = (doc_b_ind.unsqueeze(-1).unsqueeze(-1) * my_db_tokens_share).sum(dim=1)
+            rerank_candidate_pool_ind = None
         else:
             print("[融合] sem 路 Top-K + 取文档 ...")
             expanded_ind_sem = top_k_ind_sem_share.unsqueeze(-1).unsqueeze(-1)
@@ -220,30 +222,41 @@ def run_client(
             print("[融合] lex 路 Top-K（第一轮）+ 取反馈 doc ...")
             expanded_ind_lex_round1 = top_k_ind_lex_round1_share.unsqueeze(-1).unsqueeze(-1)
             my_doc_lex_round1_share = (expanded_ind_lex_round1 * my_db_tokens_share).sum(dim=1)
+            # ⭐ PRF v2: joint inference 始终用 lex_round1（不被 PRF round 2 替换）
+            my_doc_lex_share = my_doc_lex_round1_share
+
+            top_k_ind_lex_round2_share = None
 
             # 密态 PRF 扩展（与 server.py 完全对称）
+            # PRF round 2 仅供 candidate pool；不替换 my_doc_lex_share
             if PRF_ENABLED and bm25_vocab is not None:
                 if PRF_FEEDBACK_SOURCE == 'sem':
                     feedback_doc_share = my_doc_sem_share
                 elif PRF_FEEDBACK_SOURCE == 'both':
                     feedback_doc_share = my_doc_sem_share + my_doc_lex_round1_share
-                else:  # 'lex'
+                else:
                     feedback_doc_share = my_doc_lex_round1_share
                 print(f"[PRF] 反馈源={PRF_FEEDBACK_SOURCE}, 扩展 query (alpha={PRF_ALPHA}, beta={PRF_BETA}) ...")
                 q_expanded_share = secure_prf_expand_query(
                     my_query_multihot_share, feedback_doc_share, bm25_vocab,
                     alpha=PRF_ALPHA, beta=PRF_BETA,
                 )
-                print("[Client] RAG: 词汇路第二轮打分（PRF 扩展 query）...")
+                print("[Client] RAG: 词汇路第二轮打分（PRF 扩展 query, 仅供 candidate pool）...")
                 scores_lex_share_round2 = secure_lexical_score(q_expanded_share, my_bm25_matrix_share) if not LEX_BM25_ONLINE else \
                     secure_bm25_online_score(q_expanded_share, my_tf_share, my_idf_share, my_doc_norm_share, k1=LEX_BM25_K1)
 
-                print("[融合] lex 路 Top-K（第二轮）+ 取最终 doc ...")
-                top_k_ind_lex_share = secure_top_k_indicator(scores_lex_share_round2, k=TOP_K)
-                expanded_ind_lex = top_k_ind_lex_share.unsqueeze(-1).unsqueeze(-1)
-                my_doc_lex_share = (expanded_ind_lex * my_db_tokens_share).sum(dim=1)
+                print("[融合] lex 路 Top-K（第二轮）→ 仅供 candidate pool ...")
+                top_k_ind_lex_round2_share = secure_top_k_indicator(scores_lex_share_round2, k=TOP_K)
+
+            # ⭐ 构建 PRF 候选池 indicator（与 server.py 完全对称）
+            if PRF_CANDIDATE_POOL_RERANK in ('strict', 'hybrid'):
+                pool_parts = [top_k_ind_sem_share, top_k_ind_lex_round1_share]
+                if top_k_ind_lex_round2_share is not None:
+                    pool_parts.append(top_k_ind_lex_round2_share)
+                rerank_candidate_pool_ind = ArithmeticSecretSharing.cat(pool_parts, dim=0)
+                print(f"[Client] PRF candidate pool 构建: {len(pool_parts)} 个候选 doc indicator (mode={PRF_CANDIDATE_POOL_RERANK})")
             else:
-                my_doc_lex_share = my_doc_lex_round1_share
+                rerank_candidate_pool_ind = None
 
         my_query_share = s_ids[0][0]
         my_joint_ids_share = ArithmeticSecretSharing.cat(
@@ -276,10 +289,16 @@ def run_client(
             RingTensor.convert_to_ring(joint_mask),
         )
 
-        # ---------- 7. 密态 Reranker（双方对称调用一次 secure_matmul）----------
         print("[Client] 密态 reranker 计算 ...")
         from .retrieval import secure_rerank, secure_reader
-        rerank_logits_share = secure_rerank(pool, my_db_share)
+        if rerank_candidate_pool_ind is not None and PRF_CANDIDATE_POOL_RERANK == 'hybrid':
+            print(f"[Client] [Rerank-Hybrid] 全 N + 候选 boost={PRF_RERANK_BOOST} (候选 {rerank_candidate_pool_ind.shape[0]} 个) ...")
+            rerank_logits_share = secure_rerank_hybrid(pool, my_db_share, rerank_candidate_pool_ind, boost=PRF_RERANK_BOOST)
+        elif rerank_candidate_pool_ind is not None and PRF_CANDIDATE_POOL_RERANK == 'strict':
+            print(f"[Client] [Rerank-Strict] 只在候选池内重排 (候选 {rerank_candidate_pool_ind.shape[0]} 个) ...")
+            rerank_logits_share = secure_rerank_on_candidates(pool, my_db_share, rerank_candidate_pool_ind)
+        else:
+            rerank_logits_share = secure_rerank(pool, my_db_share)
 
         # ---------- 8. 密态 Reader（双方对称调用，内部含 top_k_indicator + gather）----------
         print("[Client] 密态 reader 抽取答案 ...")

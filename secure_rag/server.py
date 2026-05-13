@@ -23,7 +23,8 @@ from NssMPC.application.neural_network.layers.mha import SecBertModel
 
 from .config import (
     BERT_CONFIG, NUM_DOCS, TOP_K, SEQ, SEM_DOC_LEN, VOCAB_SIZE_BM25, TOTAL_SEQ,
-    PRF_ENABLED, PRF_ALPHA, PRF_BETA, PRF_FEEDBACK_SOURCE,
+    PRF_ENABLED, PRF_ALPHA, PRF_BETA, PRF_FEEDBACK_SOURCE, PRF_CANDIDATE_POOL_RERANK,
+    PRF_RERANK_BOOST,
     SIMHASH_ENABLED, SIMHASH_BITS, SIMHASH_CANDIDATES_M, SIMHASH_SEED,
     SPAN_READER_ENABLED, default_qa_head_path,
     LEX_BM25_ONLINE, LEX_BM25_K1, LEX_BM25_B,
@@ -43,6 +44,8 @@ from .retrieval import (
     secure_bm25_online_score,
     secure_fusion_rerank_pregen,
     secure_sem_prf_expand_query,
+    secure_rerank_on_candidates,
+    secure_rerank_hybrid,
 )
 
 
@@ -264,20 +267,28 @@ def run_server(
                 my_db_share, scores_lex_share,
                 alpha=RERANK_ALPHA, beta=RERANK_BETA, top_k2=RERANK_K2,
             )                                                                            # ASS [K2, N]
-            # 把 top-K2 拆成两个 doc 喂 sem_doc 段和 lex_doc 段（segment id 一致，顺序无关）
-            doc_a_ind = top_k2_ind_share[0:1]                                            # ASS [1, N]
+            doc_a_ind = top_k2_ind_share[0:1]
             doc_b_ind = top_k2_ind_share[1:2] if RERANK_K2 >= 2 else top_k2_ind_share[0:1]
             my_doc_sem_share = (doc_a_ind.unsqueeze(-1).unsqueeze(-1) * my_db_tokens_share).sum(dim=1)
             my_doc_lex_share = (doc_b_ind.unsqueeze(-1).unsqueeze(-1) * my_db_tokens_share).sum(dim=1)
+            # Pre-gen Rerank 模式不需要 candidate pool（已经在 fusion rerank 里筛过了）
+            rerank_candidate_pool_ind = None
         else:
-            # 默认模式：sem top-1 + lex top-1（含 PRF round 2，如启用）
+            # 默认模式：sem top-1 + lex top-1 → joint inference
+            # ⭐ PRF v2 修复: joint inference 用 lex_round1 (跟 baseline 一致，不被 PRF 覆盖)
+            # PRF round 2 的 doc 仅作为 reranker candidate pool 的额外候选
             expanded_ind_sem = top_k_ind_sem_share.unsqueeze(-1).unsqueeze(-1)
             my_doc_sem_share = (expanded_ind_sem * my_db_tokens_share).sum(dim=1)
 
             expanded_ind_lex_round1 = top_k_ind_lex_round1_share.unsqueeze(-1).unsqueeze(-1)
             my_doc_lex_round1_share = (expanded_ind_lex_round1 * my_db_tokens_share).sum(dim=1)
+            # joint inference 用 lex_round1，**始终不被 PRF 替代**
+            my_doc_lex_share = my_doc_lex_round1_share
+
+            top_k_ind_lex_round2_share = None  # 仅 PRF on 时填充
 
             # 密态 PRF 扩展：用反馈源 doc 的 token 频率反过来扩展 query
+            # PRF round 2 的 doc 不再替换 my_doc_lex_share，仅进 candidate pool
             if PRF_ENABLED and bm25_vocab is not None:
                 if PRF_FEEDBACK_SOURCE == 'sem':
                     feedback_doc_share = my_doc_sem_share
@@ -290,16 +301,23 @@ def run_server(
                     my_query_multihot_share, feedback_doc_share, bm25_vocab,
                     alpha=PRF_ALPHA, beta=PRF_BETA,
                 )
-                print("[Server] RAG: 词汇路第二轮打分（PRF 扩展 query）...")
+                print("[Server] RAG: 词汇路第二轮打分（PRF 扩展 query, 仅供 candidate pool）...")
                 scores_lex_share_round2 = secure_lexical_score(q_expanded_share, my_bm25_matrix_share) if not LEX_BM25_ONLINE else \
                     secure_bm25_online_score(q_expanded_share, my_tf_share, my_idf_share, my_doc_norm_share, k1=LEX_BM25_K1)
 
-                print("[融合] lex 路 Top-K（第二轮）+ 取最终 doc ...")
-                top_k_ind_lex_share = secure_top_k_indicator(scores_lex_share_round2, k=TOP_K)
-                expanded_ind_lex = top_k_ind_lex_share.unsqueeze(-1).unsqueeze(-1)
-                my_doc_lex_share = (expanded_ind_lex * my_db_tokens_share).sum(dim=1)
+                print("[融合] lex 路 Top-K（第二轮）→ 仅供 candidate pool ...")
+                top_k_ind_lex_round2_share = secure_top_k_indicator(scores_lex_share_round2, k=TOP_K)
+                # 注意：不再替换 my_doc_lex_share；joint inference 输入仍是 lex_round1
+
+            # ⭐ 构建 PRF 候选池 indicator (用于 PRF_CANDIDATE_POOL_RERANK)
+            if PRF_CANDIDATE_POOL_RERANK in ('strict', 'hybrid'):
+                pool_parts = [top_k_ind_sem_share, top_k_ind_lex_round1_share]
+                if top_k_ind_lex_round2_share is not None:
+                    pool_parts.append(top_k_ind_lex_round2_share)
+                rerank_candidate_pool_ind = ArithmeticSecretSharing.cat(pool_parts, dim=0)  # [K_cand, N]
+                print(f"[Server] PRF candidate pool 构建: {len(pool_parts)} 个候选 doc indicator (mode={PRF_CANDIDATE_POOL_RERANK})")
             else:
-                my_doc_lex_share = my_doc_lex_round1_share
+                rerank_candidate_pool_ind = None
 
         my_query_share = sh_in[0]
         my_joint_ids_share = ArithmeticSecretSharing.cat(
@@ -315,11 +333,20 @@ def run_server(
         print("[Server] 执行联合推理...")
         seq_out, pool = model(my_joint_ids_share, my_pos_share, my_typ_share, joint_mask)
 
-        # ---------- 7. 密态 Reranker（B2 方案）----------
-        # 把联合推理产出的 pool 跟原始文档语义库做密态 matmul，得到每篇 doc 的精排分数。
+        # ---------- 7. 密态 Reranker ----------
+        # PRF_CANDIDATE_POOL_RERANK='hybrid': 全 N + 候选 boost（推荐 default）
+        # PRF_CANDIDATE_POOL_RERANK='strict': 只在候选池内重排（ablation 用）
+        # PRF_CANDIDATE_POOL_RERANK='none':   重排全 N 库
         print("[Server] 密态 reranker 计算 ...")
         from .retrieval import secure_rerank, secure_reader
-        rerank_logits_share = secure_rerank(pool, my_db_share)
+        if rerank_candidate_pool_ind is not None and PRF_CANDIDATE_POOL_RERANK == 'hybrid':
+            print(f"[Server] [Rerank-Hybrid] 全 N + 候选 boost={PRF_RERANK_BOOST} (候选 {rerank_candidate_pool_ind.shape[0]} 个) ...")
+            rerank_logits_share = secure_rerank_hybrid(pool, my_db_share, rerank_candidate_pool_ind, boost=PRF_RERANK_BOOST)
+        elif rerank_candidate_pool_ind is not None and PRF_CANDIDATE_POOL_RERANK == 'strict':
+            print(f"[Server] [Rerank-Strict] 只在候选池内重排 (候选 {rerank_candidate_pool_ind.shape[0]} 个) ...")
+            rerank_logits_share = secure_rerank_on_candidates(pool, my_db_share, rerank_candidate_pool_ind)
+        else:
+            rerank_logits_share = secure_rerank(pool, my_db_share)
 
         # ---------- 8. 密态 Reader（抽取式生成）----------
         # SPAN_READER_ENABLED:  SQuAD-style start/end head（来自 mrm8488/bert-tiny-finetuned-squadv2）

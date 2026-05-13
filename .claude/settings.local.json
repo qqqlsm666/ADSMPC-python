@@ -51,7 +51,14 @@
       "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_rerank_on.md)",
       "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_sem_prf.md)",
       "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_all_tasks_done.md)",
-      "Bash(awk NR>=48 && NR<=72 *)"
+      "Bash(awk NR>=48 && NR<=72 *)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_numerical_compare --query_idx 4 --skip_gen_params --output experiments/results/numerical_compare_prf_candpool.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_retrieval_eval --num_queries 10 --num_docs 10 --skip_gen_params --output experiments/results/retrieval_eval_prf_candpool.md)",
+      "Bash(grep -c \"\\\\\\\\\\\\\\\\tag{\" D:/桌面/加密rag/ADSMPC-python/paper-output/lsm毕业论文.md)",
+      "Bash(grep -c \"\\\\\\\\\\\\\\\\tag{\" D:/桌面/加密rag/ADSMPC-python/paper-output/lsm毕业论文2.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_retrieval_eval --num_queries 10 --num_docs 10 --skip_gen_params --output experiments/results/retrieval_eval_prf_hybrid.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_retrieval_eval --num_queries 10 --num_docs 10 --skip_gen_params --output experiments/results/retrieval_eval_prf_v2_hybrid2.md)",
+      "Bash(DEVICE=cpu NSSMPC_GEN_NUM=10 \"/d/anaconda/envs/ADSMPC-python/python.exe\" -m experiments.run_retrieval_eval --num_queries 10 --num_docs 10 --skip_gen_params --output experiments/results/retrieval_eval_prf_v2_boost1.md)"
     ]
   }
 }

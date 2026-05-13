@@ -127,12 +127,10 @@ def secure_top_k_indicator(scores_share, k):
 
 def secure_rerank(pool_share, db_embs_share):
     """
-    [Reranker] 密态 cross-encoder reranker。
+    [Reranker - 全 N 库版] 密态 cross-encoder reranker。
 
     把联合推理产出的 pool [1, hidden] 跟原始文档库 db_embs [N_DOCS, hidden]
-    做密态 matmul，得到每篇 doc 的"重排序分数"。这是真正用上联合推理 BERT
-    输出的环节——pool 已经融合了 query + 双路 doc 的语义信息，再跟纯 doc 语义
-    库比对，相当于一个在双路初次检索之上做精排的密态 cross-encoder。
+    做密态 matmul，得到每篇 doc 的"重排序分数"。
 
     Args:
         pool_share:    ASS [1, hidden]      联合推理 pooler 输出（密态）
@@ -140,18 +138,77 @@ def secure_rerank(pool_share, db_embs_share):
 
     Returns:
         ASS [1, N_DOCS] —— 每篇 doc 的密态 rerank 分数。
-        Server 端 restore 后 argsort 取最终 top-K。
-
-    实现细节：
-        - 走 ASS @ ASS 的密态 matmul（NssMPClib 的 secure_matmul）
-        - DEBUG_LEVEL=2 下 MatrixBeaverProvider 会按需自动生成
-          [1, hidden] @ [hidden, N_DOCS] 形状的 fake MatmulTriples
-        - 通信开销：一次 matmul = 一次 send/recv restore (e/f 各一份)
-        - 计算开销：~1-2s（远小于 BERT 联合推理）
     """
     db_embs_T = db_embs_share.T                       # ASS [hidden, N_DOCS]
     rerank_logits = pool_share @ db_embs_T            # ASS [1, N_DOCS]
     return rerank_logits
+
+
+def secure_rerank_on_candidates(pool_share, db_embs_share, candidate_ind_share):
+    """
+    [Reranker - 候选池约束版] 密态 cross-encoder reranker 只在 PRF 候选池里重排。
+
+    动机：当 PRF 启用时，旧版 secure_rerank 重排全 N 库会平滑掉 PRF 的选择
+    （PRF round 2 选了不同 lex doc，但 reranker 看全 N 后又选了别的）。
+    候选池约束版让 reranker 只能从 (sem_top1 + lex_round1_top1 + lex_round2_top1) 中选，
+    PRF 的检索成果真正进入最终输出。
+
+    协议流程（全程 ASS 域）：
+        1. 候选 embedding: cand_embs = candidate_ind @ db_embs   ASS [K_cand, hidden]
+        2. 候选打分: cand_scores = pool @ cand_embs.T            ASS [1, K_cand]
+        3. 投回 N 维: scores_on_N = cand_scores @ candidate_ind  ASS [1, N]
+           非候选位置 = 0，候选位置 = 实际 rerank score；client argsort 仍能取 top-K
+
+    与 secure_rerank（全 N 版）相比，多了一次 ASS @ ASS matmul（候选投影），
+    但仍是 secure_matmul 一次，无额外通信轮。
+
+    ⚠️ 实测发现纯候选池约束会 hurt R@1（候选池只有 3 个，gt 不在候选时无法救），
+    推荐用 secure_rerank_hybrid 折中。本函数保留作为 ablation 对比。
+
+    Args:
+        pool_share:           ASS [1, hidden]      联合推理 pool
+        db_embs_share:        ASS [N, hidden]      文档语义库
+        candidate_ind_share:  ASS [K_cand, N]      候选池 indicator (一般是 PRF 多轮选出的多个 doc)
+
+    Returns:
+        ASS [1, N]  非候选位置近似 0，候选位置 = pool · doc_emb（保持与 secure_rerank 同形状）
+    """
+    # 1. 候选 embedding [K_cand, hidden]
+    cand_embs = candidate_ind_share @ db_embs_share
+    # 2. pool 跟候选 embedding 内积 [1, K_cand]
+    cand_scores = pool_share @ cand_embs.T
+    # 3. 投回 N 维: [1, K_cand] @ [K_cand, N] = [1, N]
+    scores_on_N = cand_scores @ candidate_ind_share
+    return scores_on_N
+
+
+def secure_rerank_hybrid(pool_share, db_embs_share, candidate_ind_share, boost: float = 10.0):
+    """
+    [Reranker - Hybrid 版] 全 N reranker + PRF 候选池 boost。
+
+    协议流程：
+        1. base 分数: base = pool @ db_embs.T            ASS [1, N]   (跟 secure_rerank 一样)
+        2. 候选 boost: ind_sum = candidate_ind.sum(0)   ASS [N]      (每个 doc 出现在候选池的次数)
+        3. 最终分数: rerank = base + boost * ind_sum     ASS [1, N]
+
+    动机：纯候选池约束 (secure_rerank_on_candidates) 在候选池小且 gt 不在候选里时严重 hurt R@1；
+    Hybrid 版让 PRF 候选只是 "加分"，全 N 仍参与排序，候选池起到"PRF 命中过的 doc 优先"的作用。
+
+    Args:
+        pool_share:           ASS [1, hidden]
+        db_embs_share:        ASS [N, hidden]
+        candidate_ind_share:  ASS [K_cand, N]   PRF 候选池
+        boost:                float             候选 boost 强度（公开常量；boost=0 退化到全 N reranker）
+
+    Returns:
+        ASS [1, N] reranker scores
+    """
+    # 1. base score: 全 N reranker
+    base_scores = pool_share @ db_embs_share.T                              # ASS [1, N]
+    # 2. candidate boost: 在候选位置加 boost
+    ind_sum = candidate_ind_share.sum(dim=0).view(1, -1)                    # ASS [1, N]
+    boosted_scores = base_scores + boost * ind_sum                          # ASS [1, N]
+    return boosted_scores
 
 
 def secure_reader(pool_share, seq_out_share, joint_ids_share,

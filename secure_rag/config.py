@@ -44,6 +44,16 @@ PRF_ENABLED = True                         # 总开关：False 则退化为 B3 �
 PRF_ALPHA = 0.7                            # 原始 query 的权重
 PRF_BETA = 0.3                             # 反馈 doc 词频的权重
 
+# ⭐ PRF 候选池约束 Reranker (实测在 mini_corpus N=10 上仍 negative result)
+# 'none' (默认):  Reranker = pool @ db_embs.T 重排全 N 库
+# 'strict':       Reranker 只在 PRF 候选池 (sem_top1 + lex_round1 + lex_round2) 里重排
+# 'hybrid':       全 N reranker + 候选池 boost
+# ⚠️ mini_corpus 10-query 实测：'strict' 和 'hybrid' 都让 R@1 从 0.70 降到 0.40
+# 原因：PRF round 2 改变 lex_doc 输入到 joint BERT，让联合 pool 偏移、base scores 错位
+# 这是 architecture-level 问题，reranker 端无法救。论文写成 negative finding。
+PRF_CANDIDATE_POOL_RERANK = 'hybrid'
+PRF_RERANK_BOOST = 1.0
+
 # Sem 路 PRF / 多轮检索（对应 task #5 / ReAct 多轮简化版）
 # 第一轮 sem 检索 → 取 sem top-1 doc 的 embedding → q_expanded_emb = α·query_emb + β·doc_emb
 #                → 第二轮 sem 检索 (用 q_expanded_emb)

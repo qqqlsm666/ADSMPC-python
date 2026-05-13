@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Table</title>
+<style>
+table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: "Times New Roman", serif;
+}
+th, td {
+    padding: 6px 8px;
+    text-align: center;
+}
+/* 三线表：上下粗线 + 表头下细线 */
+.table-border {
+    border-top: 1.5pt solid black;
+    border-bottom: 1.5pt solid black;
+}
+.header-line {
+    border-bottom: 0.5pt solid black;
+}
+</style>
+</head>
+
+<body>
+
+<!-- 表题（下划线） -->
+<div style="text-align:center; margin-bottom:6px;">
+    <u>表 4-1 实验参数设置详情</u>
+</div>
+
+<!-- 三线表本体 -->
+<table class="table-border">
+    <tr>
+        <th class="header-line">参数名称</th>
+        <th class="header-line">符号</th>
+        <th class="header-line">设置值</th>
+    </tr>
+    <tr>
+        <td>采样步数</td>
+        <td>T</td>
+        <td>100</td>
+    </tr>
+    <tr>
+        <td>学习率</td>
+        <td>η</td>
+        <td>1e-4</td>
+    </tr>
+    <tr>
+        <td>批大小</td>
+        <td>B</td>
+        <td>32</td>
+    </tr>
+</table>
+
+<!-- 表注 -->
+<p style="margin-top:6px;">
+注：表中参数均为本章实验默认设置，“*”表示复现结果。
+</p>
+
+</body>
+</html>

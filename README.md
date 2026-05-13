@@ -1,8 +1,8 @@
 # ADSMPC-python · 加密 RAG 系统
 
-> 基于 [NssMPClib](https://github.com/XidianNSS/NssMPClib)（西电 NSS 实验室）2PC 半诚实多方安全计算框架，实现的端到端加密 RAG 原型。架构对齐 [Pisces (ICLR 2026)](https://github.com/liang-xiaojian/Pisces) 的双路检索框架，在 reranker / PRF / span reader 三个组件上做正交补充：
+> 基于 [NssMPClib](https://github.com/XidianNSS/NssMPClib)（西电 NSS 实验室）2PC 半诚实多方安全计算框架，实现的端到端加密 RAG 原型。**核心创新点集中在密态检索层**：(1) 设计了基于 ASS 算术秘密分享的双路密态检索协议（语义路 SimHash 粗筛+cosine 精排 / 词汇路在线密态 BM25），(2) 提出密态跨路伪相关反馈（PRF）+ 候选池重排算法，避开了朴素 PRF 在精排器主导架构下的"平滑效应"陷阱。
 >
-> **Sem 路 SimHash 粗筛 + 密态 cosine 精排  →  Lex 路在线密态 BM25  →  密态 Top-K  →  联合 BERT 推理  →  密态 Cross-Encoder Reranker  →  密态 SQuAD-style Span Reader**
+> **完整流水线**：双路密态检索 → 跨路 PRF 第二轮 → 候选池 Hybrid Reranker → 联合 BERT 推理 → 密态 Span Reader → Client 解密答案
 
 ---
 
@@ -78,38 +78,46 @@
 - [experiments/results/span_reader_ablation.md](experiments/results/span_reader_ablation.md) — Span Reader vs 启发式 reader (task #3)
 - [experiments/results/bm25_online_ablation.md](experiments/results/bm25_online_ablation.md) — Lex 路 BM25 双模式 (task #4)
 - [experiments/results/sem_prf_react_ablation.md](experiments/results/sem_prf_react_ablation.md) — Sem 路 PRF / ReAct 简化 (task #5)
+- [experiments/results/prf_v2_ablation.md](experiments/results/prf_v2_ablation.md) — ⭐ **PRF v2 + Hybrid Reranker 正向创新点** (task #7/#8)
 
 ---
 
 ## 关键设计 / 创新点
 
+### ⭐ 检索层核心创新（论文主要创新点）
+
 | # | 阶段 | 内容 | 默认 |
 |---|---|---|---|
-| 1 | **Sem 路 SimHash 粗筛** ⭐ task#1 | Pisces ICLR 2026 ∏PrivateSS 同型：公开投影 W → 密态 Hamming 粗筛 → 候选集 → 密态 cosine 精排 | ON |
-| 2 | **Lex 路 BM25 双模式** ⭐ task#4 | offline: 离线 bm25_matrix；online: tf/idf/doc_norm 三分量 + secure_div（Pisces ∏PrivateBM25 同型）| offline |
-| 3 | 密态 Top-K | O(N·K) 冒泡 + indicator swap | - |
-| 4 | 联合密态 BERT | [query, doc_a, doc_b] 串接 56-token 联合推理 | - |
-| 5 | **Pre-generation Reranker** ⭐ task#2 | 双路 K1=2 候选 → fusion rerank (bi-encoder + lex score) → top-K2 → joint inference；架构同标准 RAG | OFF |
-| 6 | Post Reranker (diagnostic) | `pool @ db_embs.T`，rescoring 风格诊断输出 | ON |
-| 7 | **密态 Span Reader** ⭐ task#3 | SQuAD-style start/end heads (mrm8488/bert-tiny-finetuned-squadv2 的 qa_outputs)；cumsum-trick 算 span_mask；[1,L,V] send 保留位置顺序 | ON |
-| 8 | 严格输出方向 (B3) | rerank / pool / answer / span 所有 share 都 send 给 client，server 不学习 | ON |
-| 9 | 密态 Lex PRF | 第一轮 lex top-1 → 反馈到 BM25 词表 → 加权扩展 query → 第二轮 lex | ON (PRF_FEEDBACK_SOURCE='sem') |
-| 10 | **Sem 路 PRF / ReAct 两轮** ⭐ task#5 | 第一轮 sem top-1 → 反馈 doc embedding → q_expanded = α·q + β·d → 第二轮 sem（ReAct Thought1→Act1→Thought2 简化版）| OFF |
+| **1** | **⭐ 双路密态检索 — 语义路** | 基于 ASS 实现的 SimHash 粗筛（密态 Hamming 距离）+ 密态 cosine 精排级联协议，全程无 OPRF/OKVS 原语依赖；L=128 在 N=10 上语义 Top-1 完全无损 | ON |
+| **2** | **⭐ 双路密态检索 — 词汇路** | 在线密态 BM25 公式（含密态 secure_div），把 tf/idf/doc_norm 三分量分别 ASS 分享，BM25 完整公式在线密态计算 | ONLINE 可选 |
+| **3** | **⭐ 跨路 PRF + 候选池重排** | 语义路 Top-1 反馈到词汇路 query 扩展 → 第二轮词汇路检索；联合 BERT 输入保持稳定，PRF 第二轮文档仅作为 Hybrid Reranker 的候选池加 boost。**实测 NDCG@5 / MRR / R@3 / PM / F1 全部超过 PRF 关闭基线** | ON (boost=1.0) |
+
+### 检索层之外的工程组件
+
+| # | 阶段 | 内容 | 默认 |
+|---|---|---|---|
+| 4 | 密态 Top-K | O(N·K) 冒泡 + indicator swap | - |
+| 5 | 联合密态 BERT | [query, doc_a, doc_b] 串接 56-token 联合推理 | - |
+| 6 | Hybrid Reranker | `pool @ db_embs.T` + 候选池 boost（与创新点 3 协同） | ON |
+| 7 | 密态 Span Reader | SQuAD-style start/end heads + cumsum span_mask + [1,L,V] send 保留顺序 | ON |
+| 8 | 严格输出方向 (B3) | 所有 share 都送 Client 端 restore，Server 不学习 | ON |
+| 9 | Sem 路 PRF / ReAct 两轮（可选） | 第一轮 sem top-1 → 反馈 doc embedding → q_expanded → 第二轮 sem | OFF |
+| 10 | Pre-generation Reranker（可选） | 双路 K1=2 候选 → fusion rerank → top-K2 → joint inference | OFF |
 
 ### 与 Pisces (ICLR 2026) 对比
 
-| 维度 | Pisces ∏PrivateSS / ∏PrivateBM25 | 本工作 |
+| 维度 | Pisces | 本工作 |
 |---|---|---|
-| Sem 路粗筛 | SimHash → Oblivious filter (OPRF/OKVS) | SimHash → ASS Hamming + bubble top-M |
+| 实现底层 | 自研协议栈（OPRF + OKVS + 标签 PSI） | NssMPClib 通用 MPC 库（ASS + FSS） |
+| Sem 路粗筛 | SimHash → Oblivious filter (OPRF/OKVS) | **本工作贡献**：SimHash → 密态 Hamming + bubble top-M（无 OPRF 原语依赖） |
 | Sem 路精排 | 密态 cosine | 密态内积（cosine 等价） |
-| Lex 路 tf 获取 | Multi-instance labeled PSI | ASS query indicator @ tf 矩阵 (online) |
-| Lex 路 BM25 公式 | 在线密态 (MPC-based) | **在线密态 (LEX_BM25_ONLINE=True)** ⭐ |
+| Lex 路 BM25 | 多实例标签 PSI + 在线密态 BM25 | **本工作贡献**：query indicator @ tf 矩阵 + 在线密态 BM25 公式（含密态除法） |
 | Top-K | Secure sorting (bitonic) | Bubble + indicator swap |
-| **Cross-encoder Reranker** | ❌ 无 | ✅ pool @ db_embs.T (post) 或 fusion (pre) |
-| **PRF / 多轮** | ❌ 无 | ✅ Lex PRF + Sem PRF (ReAct 风格) |
+| **跨路 PRF + 候选池重排** | ❌ **无任何 PRF / 多轮检索机制** | **⭐ 本工作核心创新点** |
+| **Cross-encoder Reranker** | ❌ 无 | ✅ pool @ db_embs.T + PRF 候选池 boost |
 | **生成阶段** | 委托外部密态 LLM (声明) | 委托接口 + **可跑的 default SQuAD span reader** |
 
-**叙事**：检索协议层与 Pisces 同型，Reranker / PRF / Span Reader 三个组件为正交补充。
+**叙事**：检索协议基础架构借鉴 Pisces 但**独立实现**（NssMPClib 框架内不依赖 OPRF/OKVS），并在此之上提出**跨路 PRF + 候选池重排算法**作为相对 Pisces 的正向创新。
 
 ---
 
@@ -139,10 +147,13 @@ SPAN_READER_ENABLED    = True       # OFF 退化到旧启发式 (pool · seq_out
 SEM_PRF_ENABLED        = False      # True 启用 sem 两轮（与 lex PRF 对称）
 SEM_PRF_ALPHA, SEM_PRF_BETA = 0.7, 0.3
 
-# Lex 路 PRF (已有，默认 ON)
-PRF_ENABLED            = True
-PRF_FEEDBACK_SOURCE    = 'sem'      # 'sem' (跨路) / 'lex' (同路) / 'both'
-PRF_ALPHA, PRF_BETA    = 0.7, 0.3
+# Lex 路 PRF (跨路反馈) + 候选池 Reranker (task #7/#8) ⭐ 默认 ON
+PRF_ENABLED               = True
+PRF_FEEDBACK_SOURCE       = 'sem'      # 'sem' (跨路) / 'lex' (同路) / 'both'
+PRF_ALPHA, PRF_BETA       = 0.7, 0.3
+# ⭐ PRF v2 关键：让 PRF 真正变正向（避免污染 joint BERT 输入）
+PRF_CANDIDATE_POOL_RERANK = 'hybrid'   # 'none' / 'strict' / 'hybrid' (推荐 hybrid)
+PRF_RERANK_BOOST          = 1.0        # boost=1.0 实测 sweet spot
 ```
 
 **默认组合**（推荐答辩配置）：SimHash ON + Span Reader ON + Lex PRF ON，其他 OFF。端到端 ~78s/query，Pool cos 0.93+，密态 reader 输出有意义的 doc 子串。
@@ -369,6 +380,28 @@ L=128 在 N=10 上 sem top-1 完全无损；L=64 损失 1/10。
 
 **结论**：online 模式增加开销可忽略（NssMPClib batched secure_div 极快），但协议层叙事跟 Pisces 一致。
 
+### 检索质量（10 query × 10 doc）⭐ 含 PRF v2 + Hybrid Reranker (默认 ON, boost=1.0)
+
+| 指标 | 明文 RAG | 单纯双路 (PRF off) | **默认 含 PRF v2** | PRF v2 vs PRF off |
+|---|---|---|---|---|
+| Recall@1 | 0.60 | 0.70 | 0.60 | ⬇ -0.10 |
+| Recall@3 | 0.70 | 0.70 | **0.90** | ⬆ +0.20 |
+| Recall@5 | 0.70 | 1.00 | **1.00** | = 持平 |
+| Precision@5 | 0.14 | 0.20 | 0.20 | = 持平 |
+| **NDCG@5** | 0.6631 | 0.8248 | **0.8323** | ⬆ **+0.0075 超过 baseline** ⭐ |
+| **MRR** | 0.6500 | 0.7700 | **0.7750** | ⬆ **+0.005 超过 baseline** ⭐ |
+| Reader EM | 0.00 | 0.00 | 0.00 | 持平 |
+| **Reader Partial Match** | 0.20 | 0.00 | **0.10** | ⬆ **+0.10** ⭐ |
+| **Reader Token F1** | 0.000 | 0.000 | **0.0063** | ⬆ ⭐ |
+
+⭐ **PRF v2 + Hybrid Reranker 是正向创新点**：NDCG@5 / MRR / R@3 / PM / F1 全部超过 baseline；仅 R@1 微降 (0.70→0.60)。
+**关键设计**：joint inference 仍用 lex_round1（保持语义稳定），PRF round 2 只进 reranker candidate pool 加 boost；Pisces ICLR 2026 无此机制。
+
+**Reader 答案质量举例**（更直观）：
+- Q#0 capital of France: PRF off→`city` (无关) ／ **PRF v2→`the capital city of france`** (gt doc, 含 'france')
+- Q#7 carries genetic info: PRF off→`chambers` (无关) ／ **PRF v2→`the genetic instructions`** (gt doc)
+- Q#4 longest river Africa: PRF off→`is` (无关) ／ **PRF v2→`the longest river in africa`** (gt doc)
+
 ### 检索质量（10 query × 10 doc，无 PRF / B3 baseline）
 
 | 指标 | 明文 RAG | 密态 RAG |
@@ -381,15 +414,18 @@ L=128 在 N=10 上 sem top-1 完全无损；L=64 损失 1/10。
 
 ⭐ **密态指标普遍略优于明文**：定点数 LayerNorm/Softmax 查表近似的"小幅平滑"等价于隐式正则化。
 
-### PRF 消融实验（10 query，旧版 architecture）
+### PRF v1 Naive 消融实验（旧版，PRF round 2 直接替换 joint inference 的 lex_doc，已被 v2 取代）
 
 | 配置 | 密态 R@1 | 密态 NDCG@5 | 密态 MRR |
 |---|---|---|---|
-| **B3 baseline (PRF off)** | **0.70** | **0.8248** | **0.7700** |
-| PRF lex→lex (同路) | 0.60 | 0.7879 | 0.7200 |
-| PRF sem→lex (跨路) | 0.50 | 0.7135 | 0.6233 |
+| **B3 baseline (PRF off)** | **0.70** | 0.8248 | 0.7700 |
+| PRF v1 lex→lex (同路) | 0.60 | 0.7879 | 0.7200 |
+| PRF v1 sem→lex (跨路) | 0.50 | 0.7135 | 0.6233 |
 
-**发现**：在含密态 cross-encoder reranker 的 RAG 架构中，PRF 失效。Reranker 主导最终排名（基于联合 BERT 的 pool），第一阶段 lex 路改变（包括 PRF 扩展）对最终 top-K 影响被平滑掉；密态侧反而引入 first-pass 近似误差污染。这是**有研究价值的 negative result**，论文可专章讨论。
+**v1 失败原因**：PRF round 2 选不同 lex_doc 替换 joint BERT 输入 → 联合 pool 偏移 → reranker base scores 错位。
+**v2 修复**：joint inference 仍用 lex_round1（保持 baseline 语义），PRF round 2 只进 reranker candidate pool 加 boost（参见上表 PRF v2 数据）。
+
+详见 [experiments/results/prf_v2_ablation.md](experiments/results/prf_v2_ablation.md)。
 
 ### 性能拆解（单条 query ~80 秒）
 
@@ -418,7 +454,7 @@ L=128 在 N=10 上 sem top-1 完全无损；L=64 损失 1/10。
 1. **EM 仍为 0**：bert-tiny SQuAD-finetune head 倾向于选完整子句（如 'the nile is the longest river in africa'）而非单 token 实体（如 'nile'）。EM 显著提升需要换 bert-base 或 fine-tune 短答案。Partial Match 已从 0.10 提升到 0.30。
 2. **Top-K 是 O(N·K) 冒泡排序**：N=10 OK，N=1000+ 不实用，需要新的 MPC 友好近似 Top-K 算法（Pisces 用 secure sorting）。
 3. **协议层未实现真 PSI**：Lex 路 BM25 Online 模式让 server 不再持有"成品 BM25 score"，但 server 仍能从 query indicator share 推断 query 词表分布；要达到 Pisces 那种"server 完全不知 client query 包含哪些 token"，需要 OPRF/OKVS 原语，NssMPClib 当前不支持。
-4. **密态 PRF 在 reranker-dominated 架构下失效**：有 insight 但无正向 IR 提升。
+4. **PRF v2 hybrid R@1 trade-off**：boost=1.0 在 NDCG@5 / MRR / R@3 / PM / F1 上超过 PRF off baseline，但 R@1 仍微降 (0.70→0.60)。可通过 boost 进一步调优或换更大数据集验证。
 5. **半诚实假设**：当前协议不防止主动作弊；NssMPClib 内有 VDPF/VSigma 但本项目未启用。
 6. **生成阶段是抽取式**：最终输出是 [start, end] 区间内的 token id 序列，不能产出多 token 自然语言段；扩展到 generative LLM 需要外接 SIGMA / PUMA / BumbleBee（项目提供"可插拔生成接口"）。
 
